@@ -22,7 +22,8 @@ class CtkTooltip:
         self._tip: tk.Toplevel | None = None
         widget.bind("<Enter>", self._schedule, add="+")
         widget.bind("<Leave>", self._hide, add="+")
-        widget.bind("<Button>", self._hide, add="+")
+        widget.bind("<Button-1>", self._show_now, add="+")
+        widget.bind("<Button-3>", self._hide, add="+")
         widget.bind("<Destroy>", self._on_destroy, add="+")
 
     def _schedule(self, _event: Any = None) -> None:
@@ -75,6 +76,11 @@ class CtkTooltip:
         tip.wm_geometry(f"+{x}+{y}")
         self._tip = tip
 
+    def _show_now(self, _event: Any = None) -> None:
+        self._cancel_after()
+        self._hide()
+        self._show()
+
     def _hide(self, _event: Any = None) -> None:
         self._cancel_after()
         if self._tip is not None:
@@ -90,4 +96,8 @@ class CtkTooltip:
 
 
 def attach_ctk_tooltip(widget: Any, text: str, *, delay_ms: int = 450, wraplength: int = 320) -> None:
-    CtkTooltip(widget, text, delay_ms=delay_ms, wraplength=wraplength)
+    tooltip = CtkTooltip(widget, text, delay_ms=delay_ms, wraplength=wraplength)
+    try:
+        setattr(widget, "_ctk_tooltip", tooltip)
+    except Exception:
+        pass

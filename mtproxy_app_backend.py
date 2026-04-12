@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import ctypes
 import json
+import os
 import secrets
 import sys
 import threading
@@ -25,7 +26,7 @@ from mtproxy_collector import (
     probe_all,
     run_collection,
 )
-from mtproxy_local_proxy import LocalMTProxyServer, ProxyPool
+from mtproxy_local_proxy import DEFAULT_FAKE_TLS_DOMAIN, LocalMTProxyServer, ProxyPool
 from mtproxy_telegram import (
     DEFAULT_TELEGRAM_SOURCE_URLS,
     TelegramAuthConfig,
@@ -34,6 +35,7 @@ from mtproxy_telegram import (
     complete_login,
     deep_media_probe,
     get_auth_status,
+    light_media_probe,
     logout,
     qr_login_flow,
     request_login_code,
@@ -70,16 +72,18 @@ class AppConfig:
     autostart_enabled: bool = False
     start_minimized_to_tray: bool = False
     close_behavior: str = "ask"
-    telegram_sources_enabled: bool = True
+    telegram_sources_enabled: bool = False
     telegram_sources: list[str] = field(default_factory=lambda: list(DEFAULT_TELEGRAM_SOURCE_URLS))
-    thread_source_enabled: bool = True
+    thread_source_enabled: bool = False
     thread_source_url: str = "https://t.me/strbypass/237103"
     live_probe_interval_sec: int = 20
     live_probe_duration_sec: float = 4.0
     live_probe_top_n: int = 12
     deep_media_enabled: bool = False
+    rf_whitelist_check_enabled: bool = False
     deep_media_top_n: int = 5
     appearance: str = "auto"
+    auto_update_enabled: bool = True
     telegram_api_id: int = 0
     telegram_api_hash: str = ""
     telegram_phone: str = ""
@@ -102,9 +106,34 @@ CONFIG_FILE_NAME = "config.json"
 DATA_DIR_NAME = "data"
 FILE_ATTRIBUTE_HIDDEN = 0x02
 PERSISTENT_PROXY_CACHE_FILE_NAME = "proxy_list_persist.txt"
+RECOMMENDED_WEB_SOURCE_ADDITIONS = [
+    "https://t.me/s/ProxyFree_Ru",
+]
+RECOMMENDED_TELEGRAM_SOURCE_ADDITIONS = [
+    "https://t.me/telemtrs/16160",
+    "https://t.me/ProxyFree_Ru",
+]
+
 
 def is_public_release() -> bool:
-    return True
+    return os.environ.get("MTPROXY_PUBLIC_RELEASE", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _read_env_file(root_dir: Path) -> dict[str, str]:
+    env_path = root_dir / ".env"
+    if not env_path.exists():
+        return {}
+    values: dict[str, str] = {}
+    try:
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip().strip('"').strip("'")
+    except Exception:
+        return {}
+    return values
 
 
 class AppRuntime:
@@ -118,6 +147,7 @@ class AppRuntime:
         self.state_dir = self.root_dir / DATA_DIR_NAME
         self.state_dir.mkdir(parents=True, exist_ok=True)
         _hide_windows_path(self.state_dir)
+        self.env_values = _read_env_file(self.root_dir)
         self.config_path = self.root_dir / CONFIG_FILE_NAME
         self.config = self._load_config()
         self.pool = ProxyPool()
@@ -129,7 +159,7 @@ class AppRuntime:
             port=self.config.local_port,
             secret=self.config.local_secret,
             fake_tls_enabled=self.config.local_fake_tls_enabled,
-            fake_tls_domain=self.config.local_fake_tls_domain,
+            fake_tls_domain=self._effective_fake_tls_domain(self.config.local_fake_tls_enabled, self.config.local_fake_tls_domain),
             log_sink=self._log,
             event_sink=self._emit,
         )
@@ -147,6 +177,9 @@ class AppRuntime:
         self.telegram_lock = threading.RLock()
         self._load_initial_pool()
         self.live_probe_stop = threading.Event()
+        self._last_focused_probe_at: float = 0.0
+        self._last_broad_probe_at: float = 0.0
+        self._last_media_pulse_at: float = 0.0
         self.live_probe_thread = threading.Thread(target=self._live_probe_loop, daemon=True, name="mtproxy-live-probe")
         self.live_probe_thread.start()
         self._auth_code_hash: str = ""
@@ -155,9 +188,13 @@ class AppRuntime:
 
     @property
     def auth_config(self) -> TelegramAuthConfig:
+        env_api_id = str(self.env_values.get("MTPROXY_TELEGRAM_API_ID") or os.environ.get("MTPROXY_TELEGRAM_API_ID") or "").strip()
+        env_api_hash = str(self.env_values.get("MTPROXY_TELEGRAM_API_HASH") or os.environ.get("MTPROXY_TELEGRAM_API_HASH") or "").strip()
+        config_api_id = int(self.config.telegram_api_id or 0)
+        config_api_hash = self.config.telegram_api_hash.strip()
         return TelegramAuthConfig(
-            api_id=int(self.config.telegram_api_id or 0),
-            api_hash=self.config.telegram_api_hash.strip(),
+            api_id=int(env_api_id or config_api_id or 0),
+            api_hash=(env_api_hash or config_api_hash or ""),
             session_path=(self.root_dir / self.config.telegram_session_file).resolve(),
             phone=self.config.telegram_phone.strip(),
         )
@@ -184,7 +221,7 @@ class AppRuntime:
             port=self.config.local_port,
             secret=self.config.local_secret,
             fake_tls_enabled=self.config.local_fake_tls_enabled,
-            fake_tls_domain=self.config.local_fake_tls_domain,
+            fake_tls_domain=self._effective_fake_tls_domain(self.config.local_fake_tls_enabled, self.config.local_fake_tls_domain),
             log_sink=self._log,
             event_sink=self._emit,
         )
@@ -259,9 +296,9 @@ class AppRuntime:
                             self.auth_config,
                             upstream_proxy=best_upstream,
                             log_sink=self._log,
-                            total_timeout=max(30.0, float(self.config.fetch_timeout) * 3.0),
+                            total_timeout=max(75.0, float(self.config.fetch_timeout) * 6.0),
                             request_timeout=max(8.0, float(self.config.fetch_timeout)),
-                            max_messages=max(500, self.config.max_proxies or 4000),
+                            max_messages=max(1500, self.config.max_proxies or 8000),
                         )
                     )
                 self.thread_proxy_count = len(thread_proxies)
@@ -298,12 +335,15 @@ class AppRuntime:
 
         self.last_result = base_result
         self.last_outcomes = combined_outcomes
+        if (self.config.deep_media_enabled or self.config.rf_whitelist_check_enabled) and combined_working:
+            combined_working, combined_rejected = self._run_deep_media_checks(
+                combined_working,
+                combined_rejected,
+                strict=self.config.rf_whitelist_check_enabled,
+            )
         self.last_working = combined_working
         self.last_rejected = combined_rejected
         self.pool.replace_outcomes(combined_working)
-
-        if self.config.deep_media_enabled and combined_working:
-            self._run_deep_media_checks(combined_working)
 
         self._export_combined_results(base_result, combined_outcomes, combined_working, combined_rejected, existing_list_urls)
         self.last_refresh_finished_at = time.time()
@@ -413,40 +453,105 @@ class AppRuntime:
             unreachable_failures=3,
         )
 
-    def _run_deep_media_checks(self, working: list[ProbeOutcome]) -> None:
+    def _run_deep_media_checks(
+        self,
+        working: list[ProbeOutcome],
+        rejected: list[ProbeOutcome],
+        *,
+        strict: bool,
+    ) -> tuple[list[ProbeOutcome], list[ProbeOutcome]]:
         with self.telegram_lock:
             auth_status = asyncio.run(get_auth_status(self.auth_config, upstream_proxy=self._best_proxy()))
         if not auth_status.get("authorized"):
-            self._log("[media] skipped: telegram_session_not_authorized")
-            self._emit("telegram_auth_required", feature="deep_media")
-            return
-        top_candidates = working[: max(1, self.config.deep_media_top_n)]
+            reason = "rf_whitelist" if strict else "deep_media"
+            self._log(f"[media] skipped: telegram_session_not_authorized ({reason})")
+            self._emit("telegram_auth_required", feature=reason)
+            return working, rejected
+        candidate_limit = max(1, self.config.deep_media_top_n)
+        if strict:
+            candidate_limit = max(candidate_limit, min(20, max(10, len(working))))
+        top_candidates = working[:candidate_limit]
         self._log(f"[media] deep-checking {len(top_candidates)} proxies")
+        rejected_keys: set[tuple[str, int, str]] = set()
         for outcome in top_candidates:
             with self.telegram_lock:
                 result = asyncio.run(deep_media_probe(outcome.proxy, self.auth_config))
             self.pool.update_deep_media_score(result.proxy_key, result.score, result.note)
             self._log(f"[media] {outcome.proxy.host}:{outcome.proxy.port} -> {result.note}")
+            if strict and (result.score is None or result.score < 0.75):
+                rejected_keys.add(result.proxy_key)
+
+        if not strict or not rejected_keys:
+            return working, rejected
+
+        filtered_working: list[ProbeOutcome] = []
+        for outcome in working:
+            if outcome.proxy.key in rejected_keys:
+                rejected.append(
+                    ProbeOutcome(
+                        proxy=outcome.proxy,
+                        attempts=outcome.attempts,
+                        successes=outcome.successes,
+                        failures=outcome.failures,
+                        success_rate=outcome.success_rate,
+                        avg_latency_ms=outcome.avg_latency_ms,
+                        p95_latency_ms=outcome.p95_latency_ms,
+                        min_latency_ms=outcome.min_latency_ms,
+                        max_latency_ms=outcome.max_latency_ms,
+                        high_latency_ratio=outcome.high_latency_ratio,
+                        max_consecutive_failures=outcome.max_consecutive_failures,
+                        max_consecutive_high_latency=outcome.max_consecutive_high_latency,
+                        accepted=False,
+                        reason="rf_whitelist_media_failed",
+                        elapsed_seconds=outcome.elapsed_seconds,
+                        early_stop=outcome.early_stop,
+                    )
+                )
+            else:
+                filtered_working.append(outcome)
+
+        return filtered_working, sorted(
+            rejected,
+            key=lambda item: (item.reason, outcome_sort_key(item)),
+        )
 
     def _live_probe_loop(self) -> None:
-        while not self.live_probe_stop.wait(timeout=1.0):
-            interval = max(10, int(self.config.live_probe_interval_sec))
-            if self.live_probe_stop.wait(timeout=interval):
-                break
+        while not self.live_probe_stop.wait(timeout=5.0):
             if self.pool.count() <= 0:
                 continue
             try:
-                self._run_live_probe_once()
+                self._run_background_health_cycle()
             except Exception as exc:
                 self._log(f"[live] probe loop error: {exc}")
 
-    def _run_live_probe_once(self) -> None:
-        candidates = self.pool.select_candidates(is_media=False, limit=max(1, self.config.live_probe_top_n))
+    def _run_background_health_cycle(self) -> None:
+        now = time.time()
+        focused_interval = 35.0 if self.local_server.is_running() else 75.0
+        broad_interval = max(150.0, float(self.config.live_probe_interval_sec) * 6.0)
+        media_interval = 900.0
+
+        if (now - self._last_focused_probe_at) >= focused_interval:
+            self._run_live_probe_once(focused=True)
+            self._last_focused_probe_at = now
+
+        if (now - self._last_broad_probe_at) >= broad_interval:
+            self._run_live_probe_once(focused=False)
+            self._last_broad_probe_at = now
+
+        if (now - self._last_media_pulse_at) >= media_interval:
+            self._run_background_media_pulse()
+            self._last_media_pulse_at = now
+
+    def _run_live_probe_once(self, *, focused: bool) -> None:
+        if focused:
+            candidates = self.pool.select_monitor_targets(limit=2)
+        else:
+            candidates = self.pool.select_candidates(is_media=False, limit=max(1, min(4, self.config.live_probe_top_n)))
         if not candidates:
             return
 
         settings = ProbeSettings(
-            duration=max(2.0, float(self.config.live_probe_duration_sec)),
+            duration=min(3.5, max(2.0, float(self.config.live_probe_duration_sec if not focused else 2.5))),
             interval=0.7,
             timeout=min(6.0, self.config.timeout),
             max_latency_ms=self.config.max_latency_ms,
@@ -459,7 +564,7 @@ class AppRuntime:
             probe_all(
                 proxies=[item.proxy for item in candidates],
                 settings=settings,
-                concurrency=max(1, min(6, len(candidates))),
+                concurrency=max(1, min(2 if focused else 4, len(candidates))),
                 verbose=False,
                 log_sink=self._log,
                 event_sink=None,
@@ -467,13 +572,69 @@ class AppRuntime:
         )
         for outcome in outcomes:
             ok = outcome.successes > 0
-            self.pool.update_live_probe(
+            cooldown_reason = self.pool.update_live_probe(
                 outcome.proxy.key,
                 outcome.avg_latency_ms,
                 ok,
                 outcome.reason,
+                max_latency_ms=float(self.config.max_latency_ms or 300.0),
+                high_latency_streak_limit=2 if focused else 3,
+                failure_limit=2 if focused else 3,
+                cooldown_seconds=180.0 if focused else 120.0,
             )
-        self._emit("live_probe_updated", count=len(outcomes))
+            if cooldown_reason:
+                self._log(f"[live] demoted {outcome.proxy.host}:{outcome.proxy.port} -> {cooldown_reason}")
+                self._emit(
+                    "proxy_cooldown",
+                    host=outcome.proxy.host,
+                    port=outcome.proxy.port,
+                    reason=cooldown_reason,
+                )
+        self._emit("live_probe_updated", count=len(outcomes), focused=focused)
+
+    def _run_background_media_pulse(self) -> None:
+        if not self.local_server.is_running():
+            return
+        if not self.auth_config.api_id or not self.auth_config.api_hash.strip():
+            return
+        candidates = self.pool.select_monitor_targets(limit=1)
+        if not candidates:
+            return
+        target = candidates[0]
+        try:
+            with self.telegram_lock:
+                result = asyncio.run(light_media_probe(target.proxy, self.auth_config))
+        except Exception as exc:
+            self._log(f"[media-bg] probe error for {target.proxy.host}:{target.proxy.port} -> {exc}")
+            return
+
+        if result.note == "session_not_authorized":
+            self._emit("telegram_auth_required", feature="background_media")
+            self._log("[media-bg] skipped: telegram_session_not_authorized")
+            return
+        if result.note == "no_media_samples_found":
+            self.pool.update_deep_media_score(result.proxy_key, result.score, result.note)
+            self._log(f"[media-bg] {target.proxy.host}:{target.proxy.port} -> {result.note}")
+            return
+
+        cooldown_reason = self.pool.update_background_media_probe(
+            result.proxy_key,
+            result.score,
+            result.note,
+            failure_score=0.6,
+            cooldown_seconds=300.0,
+        )
+        self._log(
+            f"[media-bg] {target.proxy.host}:{target.proxy.port} -> "
+            f"{result.note} score={result.score if result.score is not None else 'n/a'}"
+        )
+        if cooldown_reason:
+            self._emit(
+                "proxy_cooldown",
+                host=target.proxy.host,
+                port=target.proxy.port,
+                reason=cooldown_reason,
+            )
 
     def _export_combined_results(
         self,
@@ -513,6 +674,7 @@ class AppRuntime:
         report["telegram_sources_enabled"] = self.config.telegram_sources_enabled
         report["telegram_sources"] = list(self._collect_enabled_telegram_sources())
         report["deep_media_enabled"] = self.config.deep_media_enabled
+        report["rf_whitelist_check_enabled"] = self.config.rf_whitelist_check_enabled
         report["thread_source_enabled"] = self.config.thread_source_enabled
         report["thread_source_url"] = self.config.thread_source_url
         report["proxies"] = self._augment_report_proxy_rows(report["proxies"])
@@ -571,6 +733,13 @@ class AppRuntime:
             if legacy_url:
                 merged.append(legacy_url)
         return merged
+
+    @staticmethod
+    def _effective_fake_tls_domain(enabled: bool, domain: str) -> str:
+        value = str(domain or "").strip().lower()
+        if enabled and not value:
+            return DEFAULT_FAKE_TLS_DOMAIN
+        return value
 
     def _load_manual_list_proxies(self) -> list[ProxyRecord]:
         paths = [
@@ -816,8 +985,14 @@ class AppRuntime:
         if "local_fake_tls_domain" not in data:
             data["local_fake_tls_domain"] = ""
             normalized = True
+        if "rf_whitelist_check_enabled" not in data:
+            data["rf_whitelist_check_enabled"] = False
+            normalized = True
+        if "auto_update_enabled" not in data:
+            data["auto_update_enabled"] = True
+            normalized = True
         if "telegram_sources_enabled" not in data:
-            data["telegram_sources_enabled"] = bool(data.get("thread_source_enabled", True))
+            data["telegram_sources_enabled"] = bool(data.get("thread_source_enabled", False))
             normalized = True
         if "telegram_sources" not in data or not isinstance(data.get("telegram_sources"), list):
             legacy_url = str(data.get("thread_source_url") or "").strip()
@@ -829,8 +1004,20 @@ class AppRuntime:
                 data["thread_source_url"] = telegram_sources[0]
                 normalized = True
         if "thread_source_enabled" not in data:
-            data["thread_source_enabled"] = bool(data.get("telegram_sources_enabled", True))
+            data["thread_source_enabled"] = bool(data.get("telegram_sources_enabled", False))
             normalized = True
+        sources = [str(item).strip() for item in data.get("sources", []) if str(item).strip()]
+        for source in RECOMMENDED_WEB_SOURCE_ADDITIONS:
+            if source not in sources:
+                sources.append(source)
+                normalized = True
+        data["sources"] = sources
+        telegram_sources = [str(item).strip() for item in data.get("telegram_sources", []) if str(item).strip()]
+        for source in RECOMMENDED_TELEGRAM_SOURCE_ADDITIONS:
+            if source not in telegram_sources:
+                telegram_sources.append(source)
+                normalized = True
+        data["telegram_sources"] = telegram_sources
         if normalized:
             with contextlib.suppress(Exception):
                 self.config_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

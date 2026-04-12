@@ -1,76 +1,140 @@
-# MTProxy AutoSwitch Public
+# MTProxy AutoSwitch
 
-Public-safe source tree for publishing to git.
+`MTProxy AutoSwitch` поднимает локальный MTProto frontend на `127.0.0.1:1443`, собирает прокси из веб-источников и Telegram, проверяет их и автоматически переключает upstream на лучший доступный вариант.
 
-This tree does not contain embedded Telegram `api_id` / `api_hash`. If the user wants Telegram-only features, they must enter their own API credentials inside the app. The app includes a button that opens:
+Проект является форком клиента Flowseal:
 
-```text
-https://my.telegram.org/apps
-```
+`https://github.com/Flowseal/tg-ws-proxy`
 
-## What is included
+В оригинальном проекте основной сценарий работы — локальный proxy frontend. В этом форке добавлены:
+- парсинг веб- и Telegram-источников
+- дедупликация и фильтрация списков
+- фоновая проверка доступности и стабильности
+- авто-подбор лучшего upstream-прокси
+- экспорт рабочих списков
 
-- Public source files only
-- Windows public build script: `build_release_public.bat`
-- macOS public build script: `build_release_public_macos.sh`
-- Windows PyInstaller spec: `MTProxyAutoSwitchPublic.spec`
-- macOS PyInstaller spec: `MTProxyAutoSwitchPublic.macos.spec`
-- Default startup list: `list/proxy_list.txt`
-- Public-safe `config.json`
+## Что умеет приложение
 
-## Telegram features that require user API credentials
+- Поднимать локальный MTProto proxy для Telegram на `127.0.0.1:1443`
+- Автоматически выбирать лучший upstream MTProto proxy
+- Собирать MTProto и SOCKS5 из веб-источников
+- Парсить публичные Telegram-каналы через `t.me/s/...`
+- Парсить Telegram-каналы, группы, сообщения и ветки через Telegram API после входа в аккаунт
+- Проверять прокси в фоне без полного обновления списка
+- Делать `deep media check` и строгую media-проверку для сложных сетей
+- Отправлять список рабочих прокси себе в `Избранное`
+- Использовать local Fake TLS listener
+- Экспортировать результаты в папку `list`
+- Проверять и устанавливать обновления public-версии
 
-- Parsing Telegram sources through Telegram API
-- QR login
-- Deep media check
-- Sending proxy lists to Saved Messages
+## Что лежит в репозитории
 
-## Windows build
+- `mtproxy_gui.py` — интерфейс приложения
+- `mtproxy_app_backend.py` — runtime, refresh, экспорт, локальный frontend
+- `mtproxy_local_proxy.py` — локальный MTProto/Fake TLS frontend и pool upstream-прокси
+- `mtproxy_collector.py` — веб-парсинг и первичная проверка прокси
+- `mtproxy_telegram.py` — Telegram API, авторизация, Telegram-источники, media-check
+- `mtproxy_updater.py` — автообновление public-сборки
+- `config.json` — текущий конфиг
+- `public_config.json` — шаблон конфига для public release
+- `list/` — экспортированные списки и отчеты
 
-Requirements:
+## Как пользоваться
 
-- Windows 10/11
-- Python 3.11+
+1. Запустите приложение.
+2. Нажмите `Обновить`, чтобы собрать и проверить прокси.
+3. Нажмите `Пуск`, чтобы поднять локальный proxy frontend.
+4. Подключите Telegram к локальному proxy:
+   `https://t.me/proxy?server=127.0.0.1&port=1443&secret=<secret>`
+5. Если нужно, скопируйте ссылку кнопкой на главном экране.
 
-Build:
+## Когда нужен вход в Telegram
+
+Вход в Telegram не нужен для:
+- обычного веб-парса сайтов
+- работы локального proxy frontend
+
+Вход в Telegram нужен для:
+- Telegram-источников, где нужен доступ через Telegram API
+- приватных каналов, групп и веток
+- `deep media check`
+- строгой media-проверки
+- отправки списка рабочих прокси в `Избранное`
+
+Сессия пользователя хранится локально и в зашифрованном виде.
+
+## Источники
+
+Поддерживаются:
+- веб-страницы с прямыми `https://t.me/proxy?...`
+- публичные Telegram-страницы `https://t.me/s/...`
+- Telegram API-источники вида `https://t.me/<channel>`
+- Telegram API-источники вида `https://t.me/<channel>/<message_id>`
+- Telegram API-ветки и сообщения из групп, если у аккаунта есть доступ
+
+## Файлы результата
+
+- `list/proxy_list.txt` — рабочие MTProto-прокси
+- `list/all_list.txt` — все найденные MTProto-прокси
+- `list/rejected_list.txt` — отсеянные MTProto-прокси
+- `list/socks5_list.txt` — найденные SOCKS5
+- `list/report.json` — подробный отчет
+
+## Сборка Windows
+
+### Public release
 
 ```bat
 build_release_public.bat
 ```
 
-Output:
+Результат:
 
 ```text
-release-public\MTProxyAutoSwitchPublic
+release-public\MTProxyAutoSwitchPublic\MTProxyAutoSwitchPublic.exe
+release-public\MTProxyAutoSwitchPublic.zip
 ```
 
-## macOS build
+### Private/local release
 
-Requirements:
+```bat
+build_release.bat
+```
 
-- macOS 12+ recommended
-- Python 3.11 or 3.12
-- Xcode Command Line Tools
+Результат:
 
-Quick start:
+```text
+release\MTProxyAutoSwitch\MTProxyAutoSwitch.exe
+```
+
+## Сборка macOS
+
+### Public release
 
 ```bash
-xcode-select --install
 chmod +x build_release_public_macos.sh
 ./build_release_public_macos.sh
 ```
 
-Output:
+### Private/local release
 
-```text
-release-macos/MTProxyAutoSwitchPublic/MTProxyAutoSwitchPublic.app
+```bash
+chmod +x build_release_macos.sh
+./build_release_macos.sh
 ```
 
-Detailed macOS notes are in `MACOS_BUILD.md`.
+Для macOS сборку нужно выполнять на самой macOS. Из-под Windows корректный `.app` не собирается.
 
-## Notes
+## Зависимости для сборки
 
-- This folder is intended for public publishing.
-- Telegram API keys are intentionally not embedded here.
-- `config.json` starts with empty Telegram API credentials.
-- Build the macOS `.app` on macOS, not on Windows.
+- Python 3.11+
+- `pip install -r requirements.txt`
+- `pip install pyinstaller`
+
+Если в проекте используются `customtkinter`, `telethon`, `requests`, `beautifulsoup4`, `cryptography`, они тоже должны быть установлены в окружении сборки.
+
+## Авторы
+
+- Оригинальный проект Flowseal: `https://github.com/Flowseal/tg-ws-proxy`
+- Форк и развитие: `https://github.com/pengvench/MTProxyAutoSwitch`
+- Telegram автора: `https://t.me/peppe_poppo`

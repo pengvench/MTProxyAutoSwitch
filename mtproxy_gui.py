@@ -30,6 +30,7 @@ from mtproxy_app_backend import (
     ALL_FILE_NAME,
     AppConfig,
     AppRuntime,
+    DEFAULT_FAKE_TLS_DOMAIN,
     LEGACY_OUT_DIR_NAME,
     LEGACY_WORKING_FILE_NAME,
     LIST_DIR_NAME,
@@ -39,6 +40,7 @@ from mtproxy_app_backend import (
 )
 from mtproxy_collector import DEFAULT_SOURCES
 from mtproxy_telegram import DEFAULT_TELEGRAM_SOURCE_URLS
+from mtproxy_updater import APP_PUBLIC_VERSION, fetch_latest_release, is_newer_version, launch_windows_update, prepare_windows_update
 from ui_tooltip import attach_ctk_tooltip
 
 APP_NAME = "MTProxy AutoSwitch"
@@ -81,6 +83,15 @@ COLOR_IDLE_TEXT = ("#475467", "#9AA6B2")
 COLOR_DANGER_BG = ("#D85E74", "#7F1D35")
 COLOR_DANGER_BORDER = ("#BF445A", "#9F2946")
 COLOR_DANGER_TEXT = ("#FFFFFF", "#FFFFFF")
+FAKE_TLS_PRESET_CUSTOM = "Свой домен"
+FAKE_TLS_PRESETS = [
+    DEFAULT_FAKE_TLS_DOMAIN,
+    "vk.com",
+    "www.ozon.ru",
+    "dzen.ru",
+    "mail.ru",
+    FAKE_TLS_PRESET_CUSTOM,
+]
 
 HOSTS_PATH = Path(r"C:\Windows\System32\drivers\etc\hosts")
 HOSTS_BLOCK_BEGIN = "# MTProxy AutoSwitch Telegram Web Begin"
@@ -140,6 +151,17 @@ ADVANCED_PROBE_TIPS = {
     "Live probe duration": "Длительность одной фоновой live-проверки.",
     "Live probe top N": "Сколько лучших прокси приложение перепроверяет в фоне.",
     "Deep media top N": "Сколько лучших прокси дополнительно проверять через медиа Telegram после основного отбора.",
+    "RF whitelist check": "Строгая медиа-проверка для сетей, где чаты Telegram открываются, но фото, голосовые, кружки и файлы через CDN работают нестабильно. Требует вход в Telegram.",
+}
+
+GENERAL_SETTING_TIPS = {
+    "autostart": "Приложение будет запускаться вместе с Windows.",
+    "start_minimized": "При запуске окно не будет открываться поверх рабочего стола, приложение сразу уйдет в трей.",
+    "auto_start_local": "Если уже есть рабочий пул, локальный proxy frontend стартует автоматически.",
+    "auto_update": "Только для public build. Приложение будет проверять GitHub Releases при запуске.",
+    "fake_tls": "Fake TLS маскирует локальное MTProto-подключение под обычный TLS-host. Это влияет на локальную ссылку proxy и используется как camouflage, а не как реальный upstream-домен.",
+    "telegram_sources": "Авторизованные Telegram-источники позволяют читать каналы, группы и ветки, включая случаи, где публичного web-view недостаточно.",
+    "deep_media": "Дополнительно проверяет не только открытие чатов, но и загрузку фото, файлов, голосовых и других медиа через Telegram API.",
 }
 
 
@@ -199,8 +221,60 @@ def _center_window(window: tk.Misc, width: int, height: int) -> None:
     window.geometry(f"{width}x{height}+{left}+{top}")
 
 
+def _set_fixed_window_size(window: tk.Misc, width: int, height: int) -> None:
+    _center_window(window, width, height)
+    with contextlib.suppress(Exception):
+        window.minsize(width, height)
+        window.maxsize(width, height)
+        window.resizable(False, False)
+
+
 def _bind_clipboard_shortcuts(widget: object, *, readonly: bool = False) -> None:
     target = getattr(widget, "_textbox", None) or getattr(widget, "_entry", None) or widget
+    bind_targets = [target]
+    if widget is not target:
+        bind_targets.append(widget)
+
+    def _is_text_widget() -> bool:
+        return isinstance(target, tk.Text)
+
+    def _get_selected_text() -> str:
+        try:
+            if _is_text_widget():
+                return str(target.get("sel.first", "sel.last"))
+            selection = target.selection_get()
+            return str(selection)
+        except Exception:
+            return ""
+
+    def _delete_selection() -> None:
+        try:
+            if _is_text_widget():
+                target.delete("sel.first", "sel.last")
+            else:
+                if target.selection_present():
+                    start = int(target.index("sel.first"))
+                    end = int(target.index("sel.last"))
+                    target.delete(start, end)
+        except Exception:
+            pass
+
+    def _insert_text(value: str) -> None:
+        if not value:
+            return
+        try:
+            if _is_text_widget():
+                if target.tag_ranges("sel"):
+                    target.delete("sel.first", "sel.last")
+                target.insert("insert", value)
+            else:
+                if target.selection_present():
+                    start = int(target.index("sel.first"))
+                    end = int(target.index("sel.last"))
+                    target.delete(start, end)
+                target.insert(target.index("insert"), value)
+        except Exception:
+            pass
 
     def _select_all(_event=None):
         try:
@@ -215,7 +289,10 @@ def _bind_clipboard_shortcuts(widget: object, *, readonly: bool = False) -> None
 
     def _copy(_event=None):
         try:
-            target.event_generate("<<Copy>>")
+            text = _get_selected_text()
+            if text:
+                target.clipboard_clear()
+                target.clipboard_append(text)
         except Exception:
             return "break"
         return "break"
@@ -224,7 +301,11 @@ def _bind_clipboard_shortcuts(widget: object, *, readonly: bool = False) -> None
         if readonly:
             return "break"
         try:
-            target.event_generate("<<Cut>>")
+            text = _get_selected_text()
+            if text:
+                target.clipboard_clear()
+                target.clipboard_append(text)
+                _delete_selection()
         except Exception:
             return "break"
         return "break"
@@ -233,23 +314,72 @@ def _bind_clipboard_shortcuts(widget: object, *, readonly: bool = False) -> None
         if readonly:
             return "break"
         try:
-            target.event_generate("<<Paste>>")
+            text = str(target.clipboard_get())
+            _insert_text(text)
         except Exception:
             return "break"
         return "break"
 
-    for sequence, callback in (
+    def _show_context_menu(event=None):
+        menu = None
+        try:
+            menu = tk.Menu(target, tearoff=0)
+            menu.add_command(label="Копировать", command=_copy)
+            if not readonly:
+                menu.add_command(label="Вырезать", command=_cut)
+                menu.add_command(label="Вставить", command=_paste)
+            menu.add_separator()
+            menu.add_command(label="Выделить все", command=_select_all)
+            menu.tk_popup(event.x_root, event.y_root)
+        except Exception:
+            return "break"
+        finally:
+            with contextlib.suppress(Exception):
+                menu.grab_release()
+        return "break"
+
+    sequences = (
         ("<Control-a>", _select_all),
         ("<Control-A>", _select_all),
+        ("<Control-Key-a>", _select_all),
+        ("<Control-Key-A>", _select_all),
         ("<Control-c>", _copy),
         ("<Control-C>", _copy),
+        ("<Control-Key-c>", _copy),
+        ("<Control-Key-C>", _copy),
         ("<Control-x>", _cut),
         ("<Control-X>", _cut),
+        ("<Control-Key-x>", _cut),
+        ("<Control-Key-X>", _cut),
         ("<Control-v>", _paste),
         ("<Control-V>", _paste),
-    ):
-        with contextlib.suppress(Exception):
-            target.bind(sequence, callback, add="+")
+        ("<Control-Key-v>", _paste),
+        ("<Control-Key-V>", _paste),
+        ("<<Copy>>", _copy),
+        ("<<Cut>>", _cut),
+        ("<<Paste>>", _paste),
+        ("<Button-3>", _show_context_menu),
+    )
+    for bind_target in bind_targets:
+        for sequence, callback in sequences:
+            with contextlib.suppress(Exception):
+                bind_target.bind(sequence, callback, add="+")
+
+
+def _add_help_badge(parent: ctk.CTkFrame, text: str) -> ctk.CTkLabel:
+    badge = ctk.CTkLabel(
+        parent,
+        text="?",
+        width=22,
+        height=22,
+        corner_radius=11,
+        fg_color=COLOR_ACCENT_SOFT,
+        text_color=COLOR_ACCENT,
+        font=("Segoe UI Semibold", 11),
+    )
+    badge.pack(side="left", padx=(8, 0))
+    attach_ctk_tooltip(badge, text)
+    return badge
 
 
 def _telegram_web_hosts_block() -> str:
@@ -339,6 +469,13 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         self._tray_started = False
         self._hidden_to_tray = False
         self._quitting = False
+        self.update_info: dict[str, object] = {
+            "checking": False,
+            "available": False,
+            "tag_name": "",
+            "html_url": "",
+            "status": "",
+        }
 
         self._ensure_config_flags()
         self._apply_appearance()
@@ -347,10 +484,12 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         self._build_layout()
         self._refresh_snapshot()
         self.bind("<Configure>", self._on_window_resize)
+        self._bind_global_clipboard_shortcuts()
 
         self.after(180, self._process_messages)
         self.after(600, self.refresh_auth_status)
         self.after(900, self._auto_refresh_initial)
+        self.after(1500, self._auto_check_updates)
         if self.runtime.config.start_minimized_to_tray:
             self.after(1200, lambda: self._hide_to_tray(notify=False))
 
@@ -359,6 +498,75 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         if self.runtime.config.autostart_enabled != autostart_enabled:
             self.runtime.config.autostart_enabled = autostart_enabled
             self.runtime.save_config()
+
+    def _bind_global_clipboard_shortcuts(self) -> None:
+        for sequence, action in (
+            ("<Control-Key-a>", "select_all"),
+            ("<Control-Key-A>", "select_all"),
+            ("<Control-Key-c>", "copy"),
+            ("<Control-Key-C>", "copy"),
+            ("<Control-Key-x>", "cut"),
+            ("<Control-Key-X>", "cut"),
+            ("<Control-Key-v>", "paste"),
+            ("<Control-Key-V>", "paste"),
+        ):
+            self.bind_all(sequence, lambda event, action=action: self._handle_global_clipboard_action(action, event), add="+")
+
+    def _handle_global_clipboard_action(self, action: str, _event=None):
+        widget = self.focus_get()
+        if widget is None:
+            return
+        try:
+            widget_state = str(widget.cget("state"))
+        except Exception:
+            widget_state = "normal"
+        readonly = widget_state in {"disabled", "readonly"}
+
+        try:
+            if isinstance(widget, tk.Text):
+                if action == "select_all":
+                    widget.tag_add("sel", "1.0", "end-1c")
+                elif action == "copy":
+                    text = widget.get("sel.first", "sel.last")
+                    self.clipboard_clear()
+                    self.clipboard_append(text)
+                elif action == "cut" and not readonly:
+                    text = widget.get("sel.first", "sel.last")
+                    self.clipboard_clear()
+                    self.clipboard_append(text)
+                    widget.delete("sel.first", "sel.last")
+                elif action == "paste" and not readonly:
+                    text = str(self.clipboard_get())
+                    if widget.tag_ranges("sel"):
+                        widget.delete("sel.first", "sel.last")
+                    widget.insert("insert", text)
+                else:
+                    return
+                return "break"
+
+            if isinstance(widget, tk.Entry):
+                if action == "select_all":
+                    widget.select_range(0, "end")
+                    widget.icursor("end")
+                elif action == "copy":
+                    text = widget.selection_get()
+                    self.clipboard_clear()
+                    self.clipboard_append(text)
+                elif action == "cut" and not readonly:
+                    text = widget.selection_get()
+                    self.clipboard_clear()
+                    self.clipboard_append(text)
+                    widget.delete("sel.first", "sel.last")
+                elif action == "paste" and not readonly:
+                    text = str(self.clipboard_get())
+                    if widget.selection_present():
+                        widget.delete("sel.first", "sel.last")
+                    widget.insert(widget.index("insert"), text)
+                else:
+                    return
+                return "break"
+        except Exception:
+            return
 
     def _apply_appearance(self) -> None:
         mode = self.runtime.config.appearance if self.runtime.config.appearance in APPEARANCE_LABELS else "auto"
@@ -416,6 +624,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         self.thread_var = tk.StringVar(value="Telegram-источники еще не проверялись")
         self.footer_var = tk.StringVar(value="Стартовая инициализация")
         self.progress_text_var = tk.StringVar(value="Готов к обновлению")
+        self.update_status_var = tk.StringVar(value=f"Версия {APP_PUBLIC_VERSION}")
         self.refresh_fraction = 0.0
         self.refresh_phase = ""
         self.refresh_phase_total = 0
@@ -689,6 +898,8 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             feature = str(payload.get("feature", "") or "")
             if feature == "deep_media":
                 self.progress_text_var.set("Deep media check пропущен: требуется вход в Telegram")
+            elif feature == "rf_whitelist":
+                self.progress_text_var.set("РФ white-list media check пропущен: требуется вход в Telegram")
             return
 
         if event_name == "local_server_state":
@@ -761,7 +972,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         thread_count = int(snapshot.get("thread_proxy_count", 0))
         local_url = str(snapshot.get("local_url", ""))
 
-        ui_busy = self.refresh_in_progress or self.runtime_call_count > 0
+        ui_busy = self.refresh_in_progress or self.runtime_call_count > 0 or bool(self.update_info.get("checking"))
 
         if self.refresh_in_progress:
             self.status_var.set("Обновление")
@@ -803,7 +1014,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         if running:
             self.primary_hint_var.set(f"Telegram можно подключать к {config.local_host}:{config.local_port}")
         elif ui_busy:
-            self.primary_hint_var.set("Во время обновления и авторизации управление запуском временно заблокировано.")
+            self.primary_hint_var.set("Во время обновления списка, авторизации или установки обновления управление временно заблокировано.")
         elif working_count > 0:
             self.primary_hint_var.set("Пул готов. Кнопка по центру запускает и останавливает локальный frontend.")
         else:
@@ -847,8 +1058,117 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             return
         self.start_refresh()
 
+    def _auto_check_updates(self) -> None:
+        if self._quitting or not is_public_release():
+            return
+        if not bool(getattr(self.runtime.config, "auto_update_enabled", True)):
+            return
+        self.check_for_updates(manual=False)
+
+    def _set_update_status(self, text: str) -> None:
+        self.update_info["status"] = text
+        self.update_status_var.set(text)
+        if self.settings_dialog is not None and self.settings_dialog.winfo_exists():
+            self.settings_dialog.refresh_interaction_state()
+
+    def check_for_updates(self, *, manual: bool) -> None:
+        if not is_public_release():
+            return
+        if bool(self.update_info.get("checking")):
+            return
+        self.update_info["checking"] = True
+        self._set_update_status("Проверка обновлений...")
+
+        def ui_call(callback) -> None:
+            with contextlib.suppress(Exception):
+                if self.winfo_exists():
+                    self.after(0, callback)
+
+        def worker() -> None:
+            try:
+                release = fetch_latest_release()
+                available = bool(release.tag_name) and is_newer_version(APP_PUBLIC_VERSION, release.tag_name)
+                info = {
+                    "checking": False,
+                    "available": available,
+                    "tag_name": release.tag_name,
+                    "html_url": release.html_url,
+                    "status": f"Доступна версия {release.tag_name}" if available else f"Установлена актуальная версия {APP_PUBLIC_VERSION}",
+                }
+                def on_done() -> None:
+                    self.update_info.update(info)
+                    self._set_update_status(str(info["status"]))
+                    if manual and not available:
+                        messagebox.showinfo("Обновления", "Новых версий не найдено.", parent=self)
+                    if manual and available:
+                        if messagebox.askyesno("Обновления", f"Доступна версия {release.tag_name}. Скачать и установить сейчас?", parent=self):
+                            self.install_update()
+                    elif available:
+                        self.copy_hint_var.set(f"Доступна версия {release.tag_name}")
+                        self.after(8000, lambda: self.copy_hint_var.set(""))
+                ui_call(on_done)
+            except Exception as exc:
+                def on_error() -> None:
+                    self.update_info["checking"] = False
+                    self._set_update_status("Не удалось проверить обновления")
+                    if manual:
+                        messagebox.showerror("Обновления", str(exc), parent=self)
+                ui_call(on_error)
+
+        threading.Thread(target=worker, daemon=True, name="mtproxy-update-check").start()
+
+    def install_update(self) -> None:
+        if not is_public_release():
+            return
+        if bool(self.update_info.get("checking")) or self.refresh_in_progress or self.runtime_call_count > 0:
+            return
+        self.update_info["checking"] = True
+        self._set_update_status("Подготовка обновления...")
+
+        def ui_call(callback) -> None:
+            with contextlib.suppress(Exception):
+                if self.winfo_exists():
+                    self.after(0, callback)
+
+        def worker() -> None:
+            try:
+                result = prepare_windows_update(
+                    install_dir=self.runtime.root_dir,
+                    state_dir=self.runtime.state_dir,
+                    current_version=APP_PUBLIC_VERSION,
+                    progress_sink=lambda message: ui_call(lambda message=message: self._set_update_status(message)),
+                )
+                if not result.get("available"):
+                    def on_latest() -> None:
+                        self.update_info["checking"] = False
+                        self._set_update_status(f"Установлена актуальная версия {APP_PUBLIC_VERSION}")
+                        messagebox.showinfo("Обновления", "Новых версий не найдено.", parent=self)
+                    ui_call(on_latest)
+                    return
+
+                script_path = str(result.get("script_path") or "")
+                if not script_path:
+                    raise RuntimeError("update_script_missing")
+
+                def on_ready() -> None:
+                    self.update_info["checking"] = False
+                    self._set_update_status(f"Обновление {self.update_info.get('tag_name') or 'готово'} загружено")
+                    if messagebox.askyesno("Обновления", "Обновление загружено. Перезапустить приложение и установить его сейчас?", parent=self):
+                        launch_windows_update(script_path)
+                        self._quitting = True
+                        self.destroy()
+                ui_call(on_ready)
+            except Exception as exc:
+                def on_error() -> None:
+                    self.update_info["checking"] = False
+                    self._set_update_status("Не удалось установить обновление")
+                    messagebox.showerror("Обновления", str(exc), parent=self)
+                ui_call(on_error)
+
+        threading.Thread(target=worker, daemon=True, name="mtproxy-update-install").start()
+
     def start_local_proxy(self) -> None:
-        if self.refresh_in_progress or self.runtime_call_count > 0:
+        if self.refresh_in_progress or self.runtime_call_count > 0 or bool(self.update_info.get("checking")):
             return
         if bool(self.snapshot_cache.get("local_running")):
             return
@@ -864,7 +1184,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         self.after(250, self.open_local_link_in_telegram)
 
     def stop_local_proxy(self) -> None:
-        if self.refresh_in_progress or self.runtime_call_count > 0:
+        if self.refresh_in_progress or self.runtime_call_count > 0 or bool(self.update_info.get("checking")):
             return
         try:
             self.runtime.stop_local_server()
@@ -874,7 +1194,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         self._refresh_snapshot()
 
     def start_refresh(self) -> None:
-        if self.refresh_in_progress or self.runtime_call_count > 0:
+        if self.refresh_in_progress or self.runtime_call_count > 0 or bool(self.update_info.get("checking")):
             return
         self.refresh_in_progress = True
         self._reset_refresh_progress()
@@ -892,7 +1212,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         self.refresh_thread.start()
 
     def _on_primary_action(self) -> None:
-        if self.refresh_in_progress or self.runtime_call_count > 0:
+        if self.refresh_in_progress or self.runtime_call_count > 0 or bool(self.update_info.get("checking")):
             return
         if bool(self.snapshot_cache.get("local_running")):
             self.stop_local_proxy()
@@ -921,7 +1241,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
                 webbrowser.open(web_url)
 
     def open_settings(self) -> None:
-        if self.refresh_in_progress or self.runtime_call_count > 0:
+        if self.refresh_in_progress or self.runtime_call_count > 0 or bool(self.update_info.get("checking")):
             return
         if self.settings_dialog is not None:
             try:
@@ -1113,7 +1433,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
 
     def _build_tray_menu(self) -> pystray.Menu:
         running = bool(self.snapshot_cache.get("local_running"))
-        ui_busy = self.refresh_in_progress or self.runtime_call_count > 0
+        ui_busy = self.refresh_in_progress or self.runtime_call_count > 0 or bool(self.update_info.get("checking"))
         items = [
             pystray.MenuItem("Открыть", lambda icon, item: self.after(0, self._show_from_tray), default=True),
             pystray.MenuItem("Скопировать ссылку", lambda icon, item: self.after(0, self.copy_local_link)),
@@ -1227,8 +1547,7 @@ class SettingsDialog(ctk.CTkToplevel):
         with contextlib.suppress(Exception):
             if APP_ICON_PATH.exists():
                 self.iconbitmap(str(APP_ICON_PATH))
-        _center_window(self, 860, 720)
-        self.minsize(780, 640)
+        _set_fixed_window_size(self, 980, 820)
         self.configure(fg_color=COLOR_BG)
         self.transient(app)
         self.protocol("WM_DELETE_WINDOW", self._close)
@@ -1250,6 +1569,7 @@ class SettingsDialog(ctk.CTkToplevel):
             value=getattr(config, "telegram_sources_enabled", config.thread_source_enabled)
         )
         self.deep_media_enabled_var = tk.BooleanVar(value=config.deep_media_enabled)
+        self.rf_whitelist_check_var = tk.BooleanVar(value=getattr(config, "rf_whitelist_check_enabled", False))
         self.show_advanced_probe_var = tk.BooleanVar(value=False)
 
         self.local_host_var = tk.StringVar(value=config.local_host)
@@ -1257,6 +1577,10 @@ class SettingsDialog(ctk.CTkToplevel):
         self.local_secret_var = tk.StringVar(value=config.local_secret)
         self.local_fake_tls_enabled_var = tk.BooleanVar(value=getattr(config, "local_fake_tls_enabled", False))
         self.local_fake_tls_domain_var = tk.StringVar(value=getattr(config, "local_fake_tls_domain", ""))
+        initial_fake_tls_domain = self.local_fake_tls_domain_var.get().strip().lower()
+        self.fake_tls_preset_var = tk.StringVar(
+            value=initial_fake_tls_domain if initial_fake_tls_domain in FAKE_TLS_PRESETS else FAKE_TLS_PRESET_CUSTOM
+        )
         self.phone_var = tk.StringVar(value="")
         self.code_var = tk.StringVar(value="")
         self.password_var = tk.StringVar(value="")
@@ -1277,6 +1601,7 @@ class SettingsDialog(ctk.CTkToplevel):
         self.live_probe_duration_var = tk.StringVar(value=str(config.live_probe_duration_sec))
         self.live_probe_top_n_var = tk.StringVar(value=str(config.live_probe_top_n))
         self.deep_media_top_n_var = tk.StringVar(value=str(config.deep_media_top_n))
+        self.auto_update_var = tk.BooleanVar(value=getattr(config, "auto_update_enabled", True))
         active_sources = set(config.sources)
         self.source_toggle_vars: dict[str, tk.BooleanVar] = {
             source: tk.BooleanVar(value=source in active_sources)
@@ -1317,24 +1642,26 @@ class SettingsDialog(ctk.CTkToplevel):
         self.tabs.pack(fill="both", expand=True)
         general = self.tabs.add("Общие")
         telegram = self.tabs.add("Telegram")
-        sources = self.tabs.add("Источники")
+        sources = self.tabs.add("Параметры проверки")
         pool = self.tabs.add("Пул")
         logs = self.tabs.add("Логи")
+        authors = self.tabs.add("О приложении")
 
         self._build_general_tab(general)
         self._build_telegram_tab(telegram)
         self._build_sources_tab(sources)
         self._build_pool_tab(pool)
         self._build_logs_tab(logs)
+        self._build_authors_tab(authors)
 
         footer = ctk.CTkFrame(wrapper, fg_color="transparent")
-        footer.pack(fill="x", pady=(14, 0))
+        footer.pack(fill="x", pady=(16, 4))
+        footer.grid_columnconfigure((0, 1), weight=1, uniform="settings_footer")
         self.footer_open_button = ctk.CTkButton(
             footer,
-            text="Открыть list",
-            width=120,
-            height=40,
-            corner_radius=20,
+            text="Открыть папку list",
+            height=44,
+            corner_radius=22,
             fg_color=COLOR_CARD,
             hover_color=COLOR_ACCENT_SOFT,
             border_width=1,
@@ -1343,20 +1670,19 @@ class SettingsDialog(ctk.CTkToplevel):
             font=("Segoe UI Semibold", 12),
             command=self.app.open_output_folder,
         )
-        self.footer_open_button.pack(side="left")
+        self.footer_open_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         self.save_button = ctk.CTkButton(
             footer,
             text="Сохранить",
-            width=120,
-            height=40,
-            corner_radius=20,
+            height=44,
+            corner_radius=22,
             fg_color=COLOR_ACCENT,
             hover_color=COLOR_ACCENT_HOVER,
             text_color="#FFFFFF",
             font=("Segoe UI Semibold", 12),
             command=self._save_settings,
         )
-        self.save_button.pack(side="right")
+        self.save_button.grid(row=0, column=1, sticky="ew", padx=(6, 0))
 
     def _build_general_tab(self, tab: ctk.CTkFrame) -> None:
         tab.grid_columnconfigure((0, 1), weight=1)
@@ -1370,9 +1696,18 @@ class SettingsDialog(ctk.CTkToplevel):
         right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
 
         ctk.CTkLabel(left, text="Поведение приложения", font=("Segoe UI Semibold", 16), text_color=COLOR_TEXT).pack(anchor="w", padx=18, pady=(16, 10))
-        ctk.CTkCheckBox(left, text="Запускать вместе с Windows", variable=self.autostart_var).pack(anchor="w", padx=18, pady=6)
-        ctk.CTkCheckBox(left, text="Стартовать свернутым в трей", variable=self.start_minimized_var).pack(anchor="w", padx=18, pady=6)
-        ctk.CTkCheckBox(left, text="Автостарт локального proxy frontend", variable=self.auto_start_local_var).pack(anchor="w", padx=18, pady=6)
+        row = ctk.CTkFrame(left, fg_color="transparent")
+        row.pack(anchor="w", padx=18, pady=6)
+        ctk.CTkCheckBox(row, text="Запускать вместе с Windows", variable=self.autostart_var).pack(side="left")
+        _add_help_badge(row, GENERAL_SETTING_TIPS["autostart"])
+        row = ctk.CTkFrame(left, fg_color="transparent")
+        row.pack(anchor="w", padx=18, pady=6)
+        ctk.CTkCheckBox(row, text="Стартовать свернутым в трей", variable=self.start_minimized_var).pack(side="left")
+        _add_help_badge(row, GENERAL_SETTING_TIPS["start_minimized"])
+        row = ctk.CTkFrame(left, fg_color="transparent")
+        row.pack(anchor="w", padx=18, pady=6)
+        ctk.CTkCheckBox(row, text="Автостарт локального proxy frontend", variable=self.auto_start_local_var).pack(side="left")
+        _add_help_badge(row, GENERAL_SETTING_TIPS["auto_start_local"])
         ctk.CTkLabel(left, text="Тема", text_color=COLOR_TEXT_SOFT, font=("Segoe UI", 11)).pack(anchor="w", padx=18, pady=(16, 4))
         ctk.CTkOptionMenu(
             left,
@@ -1405,17 +1740,86 @@ class SettingsDialog(ctk.CTkToplevel):
             text_color=COLOR_TEXT,
             dropdown_text_color=COLOR_TEXT,
         ).pack(anchor="w", padx=18, pady=(0, 18))
+        ctk.CTkLabel(left, text="Обновления", text_color=COLOR_TEXT_SOFT, font=("Segoe UI", 11)).pack(anchor="w", padx=18, pady=(4, 4))
+        row = ctk.CTkFrame(left, fg_color="transparent")
+        row.pack(anchor="w", padx=18, pady=6)
+        ctk.CTkCheckBox(row, text="Проверять обновления при запуске", variable=self.auto_update_var).pack(side="left")
+        _add_help_badge(row, GENERAL_SETTING_TIPS["auto_update"])
+        self.update_status_label = ctk.CTkLabel(
+            left,
+            textvariable=self.app.update_status_var,
+            text_color=COLOR_TEXT_SOFT,
+            font=("Segoe UI", 11),
+            justify="left",
+            wraplength=300,
+        )
+        self.update_status_label.pack(anchor="w", padx=18, pady=(4, 8))
+        update_actions = ctk.CTkFrame(left, fg_color="transparent")
+        update_actions.pack(fill="x", padx=18, pady=(0, 18))
+        update_actions.grid_columnconfigure((0, 1), weight=1)
+        self.check_updates_button = ctk.CTkButton(
+            update_actions,
+            text="Проверить",
+            height=34,
+            corner_radius=17,
+            fg_color=COLOR_ACCENT_SOFT,
+            hover_color=COLOR_ACCENT_SOFT_HOVER,
+            text_color=COLOR_ACCENT,
+            command=lambda: self.app.check_for_updates(manual=True),
+        )
+        self.check_updates_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.install_update_button = ctk.CTkButton(
+            update_actions,
+            text="Установить",
+            height=34,
+            corner_radius=17,
+            fg_color=COLOR_ACCENT,
+            hover_color=COLOR_ACCENT_HOVER,
+            text_color="#FFFFFF",
+            command=self.app.install_update,
+        )
+        self.install_update_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        if not is_public_release():
+            self.update_status_label.configure(text="Автообновление настроено для public build.")
+            self.check_updates_button.configure(state="disabled")
+            self.install_update_button.configure(state="disabled")
 
         ctk.CTkLabel(right, text="Локальный frontend", font=("Segoe UI Semibold", 16), text_color=COLOR_TEXT).pack(anchor="w", padx=18, pady=(16, 10))
         self._entry_row(right, "Host", self.local_host_var)
         self._entry_row(right, "Port", self.local_port_var)
         self._entry_row(right, "Secret", self.local_secret_var)
-        ctk.CTkCheckBox(
-            right,
+        fake_tls_row = ctk.CTkFrame(right, fg_color="transparent")
+        fake_tls_row.pack(fill="x", padx=18, pady=(2, 8))
+        self.fake_tls_checkbox = ctk.CTkCheckBox(
+            fake_tls_row,
             text="Включить local Fake TLS listener",
             variable=self.local_fake_tls_enabled_var,
-        ).pack(anchor="w", padx=18, pady=(2, 8))
-        self._entry_row(right, "Fake TLS domain", self.local_fake_tls_domain_var)
+            command=self._refresh_fake_tls_controls,
+        )
+        self.fake_tls_checkbox.pack(side="left")
+        _add_help_badge(fake_tls_row, GENERAL_SETTING_TIPS["fake_tls"])
+        self.fake_tls_frame = ctk.CTkFrame(right, fg_color="transparent")
+        preset_row = ctk.CTkFrame(self.fake_tls_frame, fg_color="transparent")
+        preset_row.pack(fill="x", padx=18, pady=(0, 10))
+        ctk.CTkLabel(preset_row, text="Preset", width=100, anchor="w", text_color=COLOR_TEXT_SOFT, font=("Segoe UI", 12)).pack(side="left")
+        self.fake_tls_preset_menu = ctk.CTkOptionMenu(
+            preset_row,
+            values=FAKE_TLS_PRESETS,
+            variable=self.fake_tls_preset_var,
+            width=260,
+            height=36,
+            corner_radius=18,
+            fg_color=COLOR_FIELD,
+            button_color=COLOR_FIELD_BORDER,
+            button_hover_color=COLOR_ACCENT_SOFT_HOVER,
+            dropdown_fg_color=COLOR_CARD,
+            dropdown_hover_color=COLOR_ACCENT_SOFT,
+            text_color=COLOR_TEXT,
+            dropdown_text_color=COLOR_TEXT,
+            command=self._on_fake_tls_preset_selected,
+        )
+        self.fake_tls_preset_menu.pack(side="left", fill="x", expand=True)
+        self._entry_row(self.fake_tls_frame, "Fake TLS domain", self.local_fake_tls_domain_var)
         self.regenerate_secret_button = ctk.CTkButton(
             right,
             text="Сгенерировать новый secret",
@@ -1428,11 +1832,12 @@ class SettingsDialog(ctk.CTkToplevel):
             command=self._regenerate_secret,
         )
         self.regenerate_secret_button.pack(anchor="w", padx=18, pady=(6, 18))
+        self._refresh_fake_tls_controls()
 
         ctk.CTkLabel(right, text="Telegram Web", font=("Segoe UI Semibold", 16), text_color=COLOR_TEXT).pack(anchor="w", padx=18, pady=(8, 10))
         ctk.CTkLabel(
             right,
-            text="Опционально: можно применить hosts-правила для Telegram Web. Для записи в hosts нужны права администратора.",
+            text="Опционально: hosts-правила помогают нормальной работе Telegram в браузере. Для записи в hosts нужны права администратора.",
             text_color=COLOR_TEXT_SOFT,
             font=("Segoe UI", 11),
             justify="left",
@@ -1482,12 +1887,15 @@ class SettingsDialog(ctk.CTkToplevel):
         source_card = ctk.CTkFrame(outer, corner_radius=22, fg_color=COLOR_CARD, border_width=1, border_color=COLOR_BORDER)
         source_card.pack(fill="x", pady=(0, 12))
         ctk.CTkLabel(source_card, text="Источники из Telegram", font=("Segoe UI Semibold", 16), text_color=COLOR_TEXT).pack(anchor="w", padx=18, pady=(16, 10))
+        source_toggle_row = ctk.CTkFrame(source_card, fg_color="transparent")
+        source_toggle_row.pack(anchor="w", padx=18, pady=(0, 8))
         ctk.CTkCheckBox(
-            source_card,
+            source_toggle_row,
             text="Использовать авторизованные Telegram-источники",
             variable=self.telegram_sources_enabled_var,
             command=self._handle_thread_source_toggle,
-        ).pack(anchor="w", padx=18, pady=(0, 8))
+        ).pack(side="left")
+        _add_help_badge(source_toggle_row, GENERAL_SETTING_TIPS["telegram_sources"])
         ctk.CTkLabel(
             source_card,
             text="Поддерживаются каналы, группы, сообщения и ветки в формате t.me/.... Для приватных источников нужна авторизованная сессия и доступ к чату.",
@@ -1496,12 +1904,28 @@ class SettingsDialog(ctk.CTkToplevel):
             justify="left",
             wraplength=680,
         ).pack(anchor="w", padx=18, pady=(0, 10))
+        telegram_actions = ctk.CTkFrame(source_card, fg_color="transparent")
+        telegram_actions.pack(fill="x", padx=18, pady=(0, 8))
+        self.enable_all_telegram_sources_button = ctk.CTkButton(
+            telegram_actions,
+            text="Включить все Telegram-источники",
+            height=34,
+            corner_radius=17,
+            fg_color=COLOR_ACCENT_SOFT,
+            hover_color=COLOR_ACCENT_SOFT_HOVER,
+            text_color=COLOR_ACCENT,
+            command=self._set_all_telegram_sources_enabled,
+        )
+        self.enable_all_telegram_sources_button.pack(side="left")
+        self.telegram_source_checkboxes = []
         for source in DEFAULT_TELEGRAM_SOURCE_URLS:
-            ctk.CTkCheckBox(
+            checkbox = ctk.CTkCheckBox(
                 source_card,
                 text=source,
                 variable=self.telegram_source_toggle_vars[source],
-            ).pack(anchor="w", padx=18, pady=4)
+            )
+            checkbox.pack(anchor="w", padx=18, pady=4)
+            self.telegram_source_checkboxes.append(checkbox)
         ctk.CTkLabel(
             source_card,
             text="Свои Telegram-источники",
@@ -1528,6 +1952,7 @@ class SettingsDialog(ctk.CTkToplevel):
             wraplength=680,
         )
         self.thread_requirement_label.pack(anchor="w", padx=18, pady=(0, 8))
+        self.thread_requirement_label.pack_forget()
         self.thread_status_label = ctk.CTkLabel(source_card, text="", text_color=COLOR_TEXT_SOFT, font=("Segoe UI", 12), justify="left", wraplength=680)
         self.thread_status_label.pack(anchor="w", padx=18, pady=(2, 18))
 
@@ -1537,7 +1962,7 @@ class SettingsDialog(ctk.CTkToplevel):
         if is_public_release():
             ctk.CTkLabel(
                 auth_card,
-                text="Для Telegram API в public-версии нужны ваши собственные api_id и api_hash.",
+                text="Для Telegram API в public-версии нужны ваши собственные API ID и API Hash.",
                 text_color=COLOR_TEXT_SOFT,
                 font=("Segoe UI", 11),
                 justify="left",
@@ -1547,10 +1972,16 @@ class SettingsDialog(ctk.CTkToplevel):
             self._entry_row(auth_card, "API Hash", self.telegram_api_hash_var)
             api_actions = ctk.CTkFrame(auth_card, fg_color="transparent")
             api_actions.pack(fill="x", padx=18, pady=(0, 10))
+            ctk.CTkLabel(
+                api_actions,
+                text="API ID и API Hash получаются на my.telegram.org/apps",
+                text_color=COLOR_TEXT_SOFT,
+                font=("Segoe UI", 11),
+            ).pack(side="left")
             self.open_telegram_apps_button = ctk.CTkButton(
                 api_actions,
-                text="Открыть my.telegram.org/apps",
-                width=220,
+                text="Получить API ID / API Hash",
+                width=230,
                 height=36,
                 corner_radius=18,
                 fg_color=COLOR_ACCENT_SOFT,
@@ -1558,9 +1989,9 @@ class SettingsDialog(ctk.CTkToplevel):
                 text_color=COLOR_ACCENT,
                 command=self._open_telegram_apps_page,
             )
-            self.open_telegram_apps_button.pack(side="left")
+            self.open_telegram_apps_button.pack(side="right")
         self._entry_row(auth_card, "Телефон", self.phone_var)
-        self._entry_row(auth_card, "Код", self.code_var)
+        self._entry_row_with_button(auth_card, "Код", self.code_var, button_text="Запросить код", button_command=self._request_code)
         self._password_entry_row(auth_card, "Пароль 2FA", self.password_var)
         self.auth_status_label = ctk.CTkLabel(auth_card, text="", text_color=COLOR_TEXT_SOFT, font=("Segoe UI", 12), justify="left", wraplength=700)
         self.auth_status_label.pack(anchor="w", padx=18, pady=(4, 10))
@@ -1639,7 +2070,6 @@ class SettingsDialog(ctk.CTkToplevel):
         )
         self.auth_buttons = [
             self.auth_check_button,
-            self.auth_request_code_button,
             self.auth_login_button,
             self.auth_qr_button,
             self.auth_logout_button,
@@ -1652,7 +2082,7 @@ class SettingsDialog(ctk.CTkToplevel):
 
         sources_card = ctk.CTkFrame(outer, corner_radius=22, fg_color=COLOR_CARD, border_width=1, border_color=COLOR_BORDER)
         sources_card.pack(fill="x", pady=(0, 12))
-        ctk.CTkLabel(sources_card, text="Источники", font=("Segoe UI Semibold", 16), text_color=COLOR_TEXT).pack(anchor="w", padx=18, pady=(16, 8))
+        ctk.CTkLabel(sources_card, text="Источники и параметры проверки", font=("Segoe UI Semibold", 16), text_color=COLOR_TEXT).pack(anchor="w", padx=18, pady=(16, 8))
         ctk.CTkLabel(
             sources_card,
             text="Можно включать готовые web-источники и добавлять свои URL. Telegram-источники с авторизацией настраиваются во вкладке Telegram.",
@@ -1706,12 +2136,35 @@ class SettingsDialog(ctk.CTkToplevel):
         tuning = ctk.CTkFrame(outer, corner_radius=22, fg_color=COLOR_CARD, border_width=1, border_color=COLOR_BORDER)
         tuning.pack(fill="x", pady=(0, 12))
         ctk.CTkLabel(tuning, text="Параметры проверки", font=("Segoe UI Semibold", 16), text_color=COLOR_TEXT).pack(anchor="w", padx=18, pady=(16, 10))
+        deep_media_row = ctk.CTkFrame(tuning, fg_color="transparent")
+        deep_media_row.pack(fill="x", padx=18, pady=(0, 8))
         ctk.CTkCheckBox(
-            tuning,
+            deep_media_row,
             text="Включить deep media check",
             variable=self.deep_media_enabled_var,
             command=self._handle_deep_media_toggle,
-        ).pack(anchor="w", padx=18, pady=(0, 8))
+        ).pack(side="left")
+        _add_help_badge(deep_media_row, GENERAL_SETTING_TIPS["deep_media"])
+        whitelist_row = ctk.CTkFrame(tuning, fg_color="transparent")
+        whitelist_row.pack(fill="x", padx=18, pady=(0, 8))
+        ctk.CTkCheckBox(
+            whitelist_row,
+            text="Включить РФ white-list media check",
+            variable=self.rf_whitelist_check_var,
+            command=self._handle_rf_whitelist_toggle,
+        ).pack(side="left")
+        whitelist_tip = ctk.CTkLabel(
+            whitelist_row,
+            text="?",
+            width=22,
+            height=22,
+            corner_radius=11,
+            fg_color=COLOR_ACCENT_SOFT,
+            text_color=COLOR_ACCENT,
+            font=("Segoe UI Semibold", 11),
+        )
+        whitelist_tip.pack(side="left", padx=(8, 0))
+        attach_ctk_tooltip(whitelist_tip, ADVANCED_PROBE_TIPS["RF whitelist check"])
         self.deep_media_requirement_label = ctk.CTkLabel(
             tuning,
             text="",
@@ -1721,6 +2174,7 @@ class SettingsDialog(ctk.CTkToplevel):
             wraplength=700,
         )
         self.deep_media_requirement_label.pack(anchor="w", padx=18, pady=(0, 10))
+        self.deep_media_requirement_label.pack_forget()
 
         advanced_row = ctk.CTkFrame(tuning, fg_color="transparent")
         advanced_row.pack(fill="x", padx=18, pady=(0, 8))
@@ -1832,6 +2286,86 @@ class SettingsDialog(ctk.CTkToplevel):
         )
         self.copy_logs_button.pack(side="left")
 
+    def _build_authors_tab(self, tab: ctk.CTkFrame) -> None:
+        outer = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        outer.pack(fill="both", expand=True, padx=8, pady=12)
+
+        card = ctk.CTkFrame(outer, corner_radius=22, fg_color=COLOR_CARD, border_width=1, border_color=COLOR_BORDER)
+        card.pack(fill="x", pady=(0, 12))
+        ctk.CTkLabel(card, text="О приложении", font=("Segoe UI Semibold", 16), text_color=COLOR_TEXT).pack(anchor="w", padx=18, pady=(16, 10))
+        ctk.CTkLabel(
+            card,
+            text="MTProxy AutoSwitch — форк клиента Flowseal `tg-ws-proxy`. "
+            "В оригинальном проекте основной сценарий — локальный proxy frontend. "
+            "В этом форке добавлены парсинг источников, проверка качества MTProto-прокси, "
+            "авто-подбор upstream и локальный auto-switch runtime.",
+            font=("Segoe UI", 11),
+            text_color=COLOR_TEXT_SOFT,
+            justify="left",
+            wraplength=860,
+        ).pack(anchor="w", padx=18, pady=(0, 16))
+
+        self._about_link_row(
+            card,
+            title="Оригинальный проект Flowseal",
+            body="Базовый клиент, на основе которого сделан этот форк.",
+            link_text="https://github.com/Flowseal/tg-ws-proxy",
+            url="https://github.com/Flowseal/tg-ws-proxy",
+        )
+        self._about_link_row(
+            card,
+            title="Telegram автора",
+            body="Для меня было бы очень приятно, если бы вы подписались.",
+            link_text="https://t.me/peppe_poppo",
+            url="https://t.me/peppe_poppo",
+        )
+        self._about_link_row(
+            card,
+            title="Репозиторий этого форка",
+            body="Исходники, публичные сборки и история изменений проекта.",
+            link_text="https://github.com/pengvench/MTProxyAutoSwitch",
+            url="https://github.com/pengvench/MTProxyAutoSwitch",
+            last=True,
+        )
+
+    def _about_link_row(
+        self,
+        parent: ctk.CTkFrame,
+        *,
+        title: str,
+        body: str,
+        link_text: str,
+        url: str,
+        last: bool = False,
+    ) -> None:
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=18, pady=(0, 10 if last else 12))
+        ctk.CTkLabel(
+            row,
+            text=title,
+            font=("Segoe UI Semibold", 13),
+            text_color=COLOR_TEXT,
+        ).pack(anchor="w")
+        ctk.CTkLabel(
+            row,
+            text=body,
+            font=("Segoe UI", 11),
+            text_color=COLOR_TEXT_SOFT,
+            justify="left",
+            wraplength=860,
+        ).pack(anchor="w", pady=(4, 8))
+        ctk.CTkButton(
+            row,
+            text=link_text,
+            height=38,
+            corner_radius=19,
+            fg_color=COLOR_ACCENT_SOFT,
+            hover_color=COLOR_ACCENT_SOFT_HOVER,
+            text_color=COLOR_ACCENT,
+            anchor="w",
+            command=lambda target=url: webbrowser.open(target),
+        ).pack(fill="x")
+
     def _entry_row(
         self,
         parent: ctk.CTkFrame,
@@ -1857,6 +2391,45 @@ class SettingsDialog(ctk.CTkToplevel):
         )
         entry.pack(side="left", fill="x", expand=True)
         _bind_clipboard_shortcuts(entry)
+
+    def _entry_row_with_button(
+        self,
+        parent: ctk.CTkFrame,
+        label: str,
+        variable: tk.StringVar,
+        *,
+        button_text: str,
+        button_command,
+        show: str | None = None,
+    ) -> None:
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", padx=18, pady=(0, 10))
+        ctk.CTkLabel(row, text=label, width=120, anchor="w", text_color=COLOR_TEXT_SOFT, font=("Segoe UI", 12)).pack(side="left")
+        entry = ctk.CTkEntry(
+            row,
+            textvariable=variable,
+            height=36,
+            corner_radius=18,
+            show=show,
+            fg_color=COLOR_FIELD,
+            border_color=COLOR_FIELD_BORDER,
+            text_color=COLOR_TEXT,
+        )
+        entry.pack(side="left", fill="x", expand=True)
+        _bind_clipboard_shortcuts(entry)
+        button = ctk.CTkButton(
+            row,
+            text=button_text,
+            width=132,
+            height=36,
+            corner_radius=18,
+            fg_color=COLOR_ACCENT_SOFT,
+            hover_color=COLOR_ACCENT_SOFT_HOVER,
+            text_color=COLOR_ACCENT,
+            command=button_command,
+        )
+        button.pack(side="left", padx=(8, 0))
+        self.code_request_inline_button = button
 
     def _password_entry_row(
         self,
@@ -1933,6 +2506,13 @@ class SettingsDialog(ctk.CTkToplevel):
     def refresh_from_runtime(self) -> None:
         config, snapshot = self.app.get_runtime_state(allow_stale=True)
         self.appearance_var.set(_appearance_label(config.appearance))
+        self.local_fake_tls_enabled_var.set(bool(getattr(config, "local_fake_tls_enabled", False)))
+        self.local_fake_tls_domain_var.set(str(getattr(config, "local_fake_tls_domain", "") or ""))
+        self._sync_fake_tls_preset()
+        self._refresh_fake_tls_controls()
+        self.deep_media_enabled_var.set(bool(getattr(config, "deep_media_enabled", False)))
+        self.rf_whitelist_check_var.set(bool(getattr(config, "rf_whitelist_check_enabled", False)))
+        self.auto_update_var.set(bool(getattr(config, "auto_update_enabled", True)))
         self.telegram_api_id_var.set(str(config.telegram_api_id or ""))
         self.telegram_api_hash_var.set(config.telegram_api_hash)
 
@@ -1963,12 +2543,18 @@ class SettingsDialog(ctk.CTkToplevel):
         configured_telegram_sources = list(getattr(config, "telegram_sources", []) or [])
         for source, variable in self.telegram_source_toggle_vars.items():
             variable.set(source in configured_telegram_sources)
+        telegram_textbox = getattr(self.telegram_sources_box, "_textbox", self.telegram_sources_box)
+        telegram_box_state = str(telegram_textbox.cget("state"))
+        if telegram_box_state == "disabled":
+            telegram_textbox.configure(state="normal")
         current_custom_telegram = [line.strip() for line in self.telegram_sources_box.get("1.0", "end").splitlines() if line.strip()]
         custom_telegram_sources = [source for source in configured_telegram_sources if source not in self.telegram_source_toggle_vars]
         if current_custom_telegram != custom_telegram_sources:
             self.telegram_sources_box.delete("1.0", "end")
             if custom_telegram_sources:
                 self.telegram_sources_box.insert("1.0", "\n".join(custom_telegram_sources))
+        if telegram_box_state == "disabled":
+            telegram_textbox.configure(state="disabled")
         self.telegram_sources_enabled_var.set(bool(getattr(config, "telegram_sources_enabled", config.thread_source_enabled)))
 
         thread_text = _format_thread_status(str(snapshot.get("thread_status", "")), int(snapshot.get("thread_proxy_count", 0)))
@@ -1999,13 +2585,16 @@ class SettingsDialog(ctk.CTkToplevel):
         self.refresh_interaction_state()
 
     def refresh_interaction_state(self) -> None:
-        busy = self.app.refresh_in_progress or self.app.runtime_call_count > 0
+        busy = self.app.refresh_in_progress or self.app.runtime_call_count > 0 or bool(self.app.update_info.get("checking"))
+        auth_required_disabled = not bool(self.app.auth_status.get("authorized"))
         for button in getattr(self, "auth_buttons", []):
             button.configure(state="disabled" if busy else "normal")
         for widget in (
             getattr(self, "save_button", None),
             getattr(self, "footer_open_button", None),
             getattr(self, "regenerate_secret_button", None),
+            getattr(self, "check_updates_button", None),
+            getattr(self, "install_update_button", None),
             getattr(self, "open_telegram_apps_button", None),
             getattr(self, "copy_hosts_button", None),
             getattr(self, "apply_hosts_button", None),
@@ -2013,9 +2602,31 @@ class SettingsDialog(ctk.CTkToplevel):
             getattr(self, "copy_pool_button", None),
             getattr(self, "copy_logs_button", None),
             getattr(self, "enable_all_sources_button", None),
+            getattr(self, "author_user_button", None),
+            getattr(self, "author_origin_button", None),
         ):
             if widget is not None:
                 widget.configure(state="disabled" if busy else "normal")
+        if hasattr(self, "install_update_button"):
+            update_available = bool(self.app.update_info.get("available"))
+            update_busy = bool(self.app.update_info.get("checking"))
+            self.install_update_button.configure(
+                state="normal" if (is_public_release() and update_available and not busy and not update_busy) else "disabled"
+            )
+        if hasattr(self, "check_updates_button"):
+            update_busy = bool(self.app.update_info.get("checking"))
+            self.check_updates_button.configure(state="normal" if (is_public_release() and not busy and not update_busy) else "disabled")
+        for checkbox in getattr(self, "telegram_source_checkboxes", []):
+            checkbox.configure(state="disabled" if (busy or auth_required_disabled) else "normal")
+        for widget in (
+            getattr(self, "enable_all_telegram_sources_button", None),
+        ):
+            if widget is not None:
+                widget.configure(state="disabled" if (busy or auth_required_disabled) else "normal")
+        telegram_box = getattr(self, "telegram_sources_box", None)
+        if telegram_box is not None:
+            textbox = getattr(telegram_box, "_textbox", telegram_box)
+            textbox.configure(state="disabled" if (busy or auth_required_disabled) else "normal")
         self._refresh_auth_controls(busy=busy)
 
     def _refresh_requirement_hints(self) -> None:
@@ -2023,22 +2634,31 @@ class SettingsDialog(ctk.CTkToplevel):
         is_authorized = bool(auth.get("authorized"))
         thread_enabled = bool(self.telegram_sources_enabled_var.get())
         deep_media_enabled = bool(self.deep_media_enabled_var.get())
+        rf_whitelist_enabled = bool(self.rf_whitelist_check_var.get())
 
         if hasattr(self, "thread_requirement_label"):
             if thread_enabled and not is_authorized:
                 self.thread_requirement_label.configure(
                     text="Для парса Telegram-источников нужна авторизованная Telegram-сессия. Без входа каналы, группы и ветки через Telegram API будут пропущены."
                 )
+                if not self.thread_requirement_label.winfo_manager():
+                    self.thread_requirement_label.pack(anchor="w", padx=18, pady=(0, 8), before=self.thread_status_label)
             else:
                 self.thread_requirement_label.configure(text="")
+                if self.thread_requirement_label.winfo_manager():
+                    self.thread_requirement_label.pack_forget()
 
         if hasattr(self, "deep_media_requirement_label"):
-            if deep_media_enabled and not is_authorized:
+            if (deep_media_enabled or rf_whitelist_enabled) and not is_authorized:
                 self.deep_media_requirement_label.configure(
-                    text="Deep media check требует авторизованную Telegram-сессию. Без входа проверка медиа будет пропущена."
+                    text="Media-проверки требуют авторизованную Telegram-сессию. Без входа deep media check и РФ white-list check будут пропущены."
                 )
+                if not self.deep_media_requirement_label.winfo_manager():
+                    self.deep_media_requirement_label.pack(anchor="w", padx=18, pady=(0, 10), before=self.advanced_probe_frame)
             else:
                 self.deep_media_requirement_label.configure(text="")
+                if self.deep_media_requirement_label.winfo_manager():
+                    self.deep_media_requirement_label.pack_forget()
 
     def _set_all_sources_enabled(self) -> None:
         for variable in self.source_toggle_vars.values():
@@ -2047,6 +2667,16 @@ class SettingsDialog(ctk.CTkToplevel):
             self.telegram_sources_enabled_var.set(True)
             for variable in self.telegram_source_toggle_vars.values():
                 variable.set(True)
+        self._refresh_requirement_hints()
+
+    def _set_all_telegram_sources_enabled(self) -> None:
+        if not bool(self.app.auth_status.get("authorized")):
+            self.telegram_sources_enabled_var.set(False)
+            self._show_auth_required_alert("Telegram-источники")
+            return
+        self.telegram_sources_enabled_var.set(True)
+        for variable in self.telegram_source_toggle_vars.values():
+            variable.set(True)
         self._refresh_requirement_hints()
 
     def _refresh_advanced_probe_visibility(self) -> None:
@@ -2096,7 +2726,6 @@ class SettingsDialog(ctk.CTkToplevel):
         is_authorized = bool(self.app.auth_status.get("authorized"))
         if hasattr(self, "auth_check_button"):
             self.auth_check_button.grid_forget()
-            self.auth_request_code_button.grid_forget()
             self.auth_login_button.grid_forget()
             self.auth_qr_button.grid_forget()
             self.auth_logout_button.grid_forget()
@@ -2113,13 +2742,13 @@ class SettingsDialog(ctk.CTkToplevel):
                 )
             else:
                 self.auth_check_button.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=(0, 8))
-                self.auth_request_code_button.grid(row=0, column=1, sticky="ew", padx=6, pady=(0, 8))
-                self.auth_qr_button.grid(row=0, column=2, sticky="ew", padx=(6, 0), pady=(0, 8))
-                self.auth_login_button.grid(row=1, column=0, columnspan=3, sticky="ew")
+                self.auth_qr_button.grid(row=0, column=1, sticky="ew", padx=6, pady=(0, 8))
+                self.auth_login_button.grid(row=0, column=2, sticky="ew", padx=(6, 0), pady=(0, 8))
                 self.auth_check_button.configure(state="disabled" if busy else "normal")
-                self.auth_request_code_button.configure(state="disabled" if busy else "normal")
                 self.auth_qr_button.configure(state="disabled" if busy else "normal")
                 self.auth_login_button.configure(state="disabled" if busy else "normal")
+            if hasattr(self, "code_request_inline_button"):
+                self.code_request_inline_button.configure(state="disabled" if (busy or is_authorized) else "normal")
 
     def _show_auth_required_alert(self, feature_name: str) -> None:
         messagebox.showwarning(
@@ -2144,6 +2773,14 @@ class SettingsDialog(ctk.CTkToplevel):
             self.deep_media_enabled_var.set(False)
             self._refresh_requirement_hints()
             self._show_auth_required_alert("Deep media check")
+            return
+        self._refresh_requirement_hints()
+
+    def _handle_rf_whitelist_toggle(self) -> None:
+        if self.rf_whitelist_check_var.get() and not bool(self.app.auth_status.get("authorized")):
+            self.rf_whitelist_check_var.set(False)
+            self._refresh_requirement_hints()
+            self._show_auth_required_alert("РФ white-list media check")
             return
         self._refresh_requirement_hints()
 
@@ -2231,6 +2868,37 @@ class SettingsDialog(ctk.CTkToplevel):
     def _regenerate_secret(self) -> None:
         self.local_secret_var.set(secrets.token_hex(16))
 
+    def _refresh_fake_tls_controls(self) -> None:
+        if not hasattr(self, "fake_tls_frame"):
+            return
+        enabled = bool(self.local_fake_tls_enabled_var.get())
+        if enabled:
+            if not self.local_fake_tls_domain_var.get().strip():
+                self.local_fake_tls_domain_var.set(DEFAULT_FAKE_TLS_DOMAIN)
+            if not self.fake_tls_frame.winfo_manager():
+                self.fake_tls_frame.pack(fill="x", padx=0, pady=(0, 4), before=self.regenerate_secret_button)
+        elif self.fake_tls_frame.winfo_manager():
+            self.fake_tls_frame.pack_forget()
+        self._sync_fake_tls_preset()
+
+    def _sync_fake_tls_preset(self) -> None:
+        if not hasattr(self, "fake_tls_preset_var"):
+            return
+        domain = self.local_fake_tls_domain_var.get().strip().lower()
+        if domain in FAKE_TLS_PRESETS:
+            self.fake_tls_preset_var.set(domain)
+        elif not domain:
+            self.fake_tls_preset_var.set(DEFAULT_FAKE_TLS_DOMAIN)
+        else:
+            self.fake_tls_preset_var.set(FAKE_TLS_PRESET_CUSTOM)
+
+    def _on_fake_tls_preset_selected(self, choice: str) -> None:
+        selected = str(choice or "").strip().lower()
+        if selected and selected != FAKE_TLS_PRESET_CUSTOM.lower():
+            self.local_fake_tls_domain_var.set(selected)
+        elif not self.local_fake_tls_domain_var.get().strip():
+            self.local_fake_tls_domain_var.set(DEFAULT_FAKE_TLS_DOMAIN)
+
     def _save_settings(self) -> None:
         try:
             payload = asdict(self.app.runtime.config)
@@ -2246,6 +2914,8 @@ class SettingsDialog(ctk.CTkToplevel):
             payload["local_secret"] = self.local_secret_var.get().strip().lower()
             payload["local_fake_tls_enabled"] = bool(self.local_fake_tls_enabled_var.get())
             payload["local_fake_tls_domain"] = self.local_fake_tls_domain_var.get().strip().lower()
+            if payload["local_fake_tls_enabled"] and not payload["local_fake_tls_domain"]:
+                payload["local_fake_tls_domain"] = DEFAULT_FAKE_TLS_DOMAIN
             payload["telegram_sources_enabled"] = bool(self.telegram_sources_enabled_var.get())
             payload["telegram_sources"] = self._collect_telegram_sources_from_controls()
             payload["thread_source_enabled"] = payload["telegram_sources_enabled"]
@@ -2265,19 +2935,19 @@ class SettingsDialog(ctk.CTkToplevel):
             payload["live_probe_duration_sec"] = _read_float(self.live_probe_duration_var.get(), "live_probe_duration_sec")
             payload["live_probe_top_n"] = _read_int(self.live_probe_top_n_var.get(), "live_probe_top_n")
             payload["deep_media_enabled"] = bool(self.deep_media_enabled_var.get())
+            payload["rf_whitelist_check_enabled"] = bool(self.rf_whitelist_check_var.get())
             payload["deep_media_top_n"] = _read_int(self.deep_media_top_n_var.get(), "deep_media_top_n")
+            payload["auto_update_enabled"] = bool(self.auto_update_var.get())
             payload["sources"] = self._collect_sources_from_controls()
             payload["telegram_api_id"] = _read_int(self.telegram_api_id_var.get() or "0", "telegram_api_id", allow_zero=True)
             payload["telegram_api_hash"] = self.telegram_api_hash_var.get().strip()
             if not payload["local_secret"]:
                 raise ValueError("local_secret is required")
-            if payload["local_fake_tls_enabled"] and not payload["local_fake_tls_domain"]:
-                raise ValueError("local_fake_tls_domain is required")
             if payload["local_fake_tls_domain"]:
                 payload["local_fake_tls_domain"].encode("ascii")
             if not payload["sources"]:
                 raise ValueError("sources list is empty")
-            if is_public_release() and bool(payload["telegram_sources_enabled"] or payload["deep_media_enabled"]):
+            if is_public_release() and bool(payload["telegram_sources_enabled"] or payload["deep_media_enabled"] or payload["rf_whitelist_check_enabled"]):
                 if not payload["telegram_api_id"] or not payload["telegram_api_hash"]:
                     raise ValueError("telegram_api_id and telegram_api_hash are required for Telegram features in public release")
             self.app.apply_config(AppConfig(**payload))
@@ -2352,7 +3022,6 @@ class SettingsDialog(ctk.CTkToplevel):
             self.auth_status_label.configure(text="Требуется пароль 2FA для завершения входа")
             if self.app.qr_dialog is not None and self.app.qr_dialog.winfo_exists():
                 self.app.qr_dialog.show_password_prompt()
-            messagebox.showinfo("Telegram", "Нужен пароль 2FA", parent=self.app)
             return
         if result.get("timeout"):
             if self.app.qr_dialog is not None and self.app.qr_dialog.winfo_exists():
@@ -2391,19 +3060,21 @@ class SettingsDialog(ctk.CTkToplevel):
             payload["local_secret"] = self.local_secret_var.get().strip().lower()
             payload["local_fake_tls_enabled"] = bool(self.local_fake_tls_enabled_var.get())
             payload["local_fake_tls_domain"] = self.local_fake_tls_domain_var.get().strip().lower()
+            if payload["local_fake_tls_enabled"] and not payload["local_fake_tls_domain"]:
+                payload["local_fake_tls_domain"] = DEFAULT_FAKE_TLS_DOMAIN
             payload["telegram_sources_enabled"] = bool(self.telegram_sources_enabled_var.get())
             payload["telegram_sources"] = self._collect_telegram_sources_from_controls()
             payload["thread_source_enabled"] = payload["telegram_sources_enabled"]
             payload["thread_source_url"] = payload["telegram_sources"][0] if payload["telegram_sources"] else ""
             payload["telegram_phone"] = ""
             payload["sources"] = self._collect_sources_from_controls()
+            payload["rf_whitelist_check_enabled"] = bool(self.rf_whitelist_check_var.get())
+            payload["auto_update_enabled"] = bool(self.auto_update_var.get())
             payload["telegram_api_id"] = _read_int(self.telegram_api_id_var.get() or "0", "telegram_api_id", allow_zero=True)
             payload["telegram_api_hash"] = self.telegram_api_hash_var.get().strip()
-            if payload["local_fake_tls_enabled"] and not payload["local_fake_tls_domain"]:
-                raise ValueError("local_fake_tls_domain is required")
             if payload["local_fake_tls_domain"]:
                 payload["local_fake_tls_domain"].encode("ascii")
-            if is_public_release() and bool(payload["telegram_sources_enabled"] or payload["deep_media_enabled"]):
+            if is_public_release() and bool(payload["telegram_sources_enabled"] or payload["deep_media_enabled"] or payload["rf_whitelist_check_enabled"]):
                 if not payload["telegram_api_id"] or not payload["telegram_api_hash"]:
                     raise ValueError("telegram_api_id and telegram_api_hash are required for Telegram features in public release")
             self.app.apply_config(AppConfig(**payload))
@@ -2442,8 +3113,7 @@ class QRAuthDialog(ctk.CTkToplevel):
         with contextlib.suppress(Exception):
             if APP_ICON_PATH.exists():
                 self.iconbitmap(str(APP_ICON_PATH))
-        _center_window(self, 380, 560)
-        self.resizable(False, False)
+        _set_fixed_window_size(self, 420, 620)
         self.transient(parent)
         self.grab_set()
         self.configure(fg_color=COLOR_BG)
@@ -2560,6 +3230,14 @@ class QRAuthDialog(ctk.CTkToplevel):
         self.password_hint_label.configure(text="Telegram запросил пароль 2FA. Введите пароль и нажмите продолжить.")
         if not self.password_wrap.winfo_manager():
             self.password_wrap.pack(fill="x", padx=18, pady=(4, 0))
+        with contextlib.suppress(Exception):
+            settings_dialog = self.app.settings_dialog
+            if settings_dialog is not None and settings_dialog.winfo_exists():
+                preset = settings_dialog.password_var.get().strip()
+                if preset and not self.qr_password_var.get().strip():
+                    self.qr_password_var.set(preset)
+        with contextlib.suppress(Exception):
+            self.qr_password_entry.focus_force()
         self._bring_to_front()
 
     def mark_expired(self) -> None:
@@ -2642,8 +3320,7 @@ class CloseActionDialog(ctk.CTkToplevel):
         self.result: str | None = None
         self.remember_var = tk.BooleanVar(value=False)
         self.title("Закрытие приложения")
-        _center_window(self, 380, 210)
-        self.resizable(False, False)
+        _set_fixed_window_size(self, 470, 250)
         self.transient(parent)
         self.grab_set()
         self.configure(fg_color=COLOR_BG)
@@ -2664,32 +3341,33 @@ class CloseActionDialog(ctk.CTkToplevel):
             text_color=COLOR_TEXT_SOFT,
             font=("Segoe UI", 12),
             justify="left",
-            wraplength=300,
+            wraplength=380,
         ).pack(anchor="w", padx=18)
         ctk.CTkCheckBox(card, text="Запомнить выбор", variable=self.remember_var).pack(anchor="w", padx=18, pady=(14, 14))
 
         actions = ctk.CTkFrame(card, fg_color="transparent")
         actions.pack(fill="x", padx=18, pady=(0, 18))
+        actions.grid_columnconfigure((0, 1), weight=1, uniform="close_actions")
         ctk.CTkButton(
             actions,
             text="Скрыть в трей",
-            height=38,
-            corner_radius=19,
+            height=42,
+            corner_radius=21,
             fg_color=COLOR_ACCENT_SOFT,
             hover_color=COLOR_ACCENT_SOFT_HOVER,
             text_color=COLOR_ACCENT,
             command=lambda: self._choose("tray"),
-        ).pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 8))
         ctk.CTkButton(
             actions,
             text="Закрыть",
-            height=38,
-            corner_radius=19,
+            height=42,
+            corner_radius=21,
             fg_color=COLOR_ACCENT,
             hover_color=COLOR_ACCENT_HOVER,
             text_color="#FFFFFF",
             command=lambda: self._choose("exit"),
-        ).pack(side="left", fill="x", expand=True, padx=(6, 0))
+        ).grid(row=0, column=1, sticky="ew", padx=(8, 0))
 
     def _choose(self, value: str) -> None:
         self.result = value

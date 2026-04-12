@@ -33,12 +33,14 @@ PROXY_URL_RE = re.compile(r"(?:https://t\.me/proxy\?|tg://proxy\?)[^\s<>'\"]+", 
 DEFAULT_MEDIA_CHANNELS = ["telegram", "durov", "TelegramTips"]
 DEFAULT_TELEGRAM_SOURCE_URLS = [
     "https://t.me/strbypass/237103",
+    "https://t.me/telemtrs/16160",
     "https://t.me/mtpro_xyz",
+    "https://t.me/ProxyFree_Ru",
 ]
 DEFAULT_AUTH_TIMEOUT = 20.0
-DEFAULT_THREAD_TOTAL_TIMEOUT = 45.0
+DEFAULT_THREAD_TOTAL_TIMEOUT = 90.0
 DEFAULT_THREAD_REQUEST_TIMEOUT = 12.0
-DEFAULT_THREAD_MAX_MESSAGES = 4000
+DEFAULT_THREAD_MAX_MESSAGES = 8000
 THREAD_PROGRESS_EVERY = 200
 DEFAULT_QR_TOTAL_TIMEOUT = 90.0
 SESSION_KEY_FILE_NAME = "session_key.bin"
@@ -662,7 +664,7 @@ def _extract_message_proxies(message: Any, source_url: str) -> list[ProxyRecord]
         buttons = getattr(row, "buttons", None) or []
         for button in buttons:
             url = getattr(button, "url", None)
-            if isinstance(url, str) and url.startswith("https://t.me/proxy?"):
+            if isinstance(url, str) and (url.startswith("https://t.me/proxy?") or url.startswith("tg://proxy?")):
                 proxy = parse_proxy_link(url, source_url, source_url)
                 if proxy is not None:
                     records[proxy.key] = proxy

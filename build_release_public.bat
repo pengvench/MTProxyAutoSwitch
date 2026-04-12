@@ -20,6 +20,8 @@ copy /Y config.json release-public\MTProxyAutoSwitchPublic\config.json >nul
 if exist icon.ico copy /Y icon.ico release-public\MTProxyAutoSwitchPublic\icon.ico >nul
 if not exist release-public\MTProxyAutoSwitchPublic\list mkdir release-public\MTProxyAutoSwitchPublic\list
 if exist list\proxy_list.txt copy /Y list\proxy_list.txt release-public\MTProxyAutoSwitchPublic\list\proxy_list.txt >nul
+if exist release-public\MTProxyAutoSwitchPublic.zip del /f /q release-public\MTProxyAutoSwitchPublic.zip
+powershell -NoProfile -Command "Compress-Archive -Path 'release-public\\MTProxyAutoSwitchPublic\\*' -DestinationPath 'release-public\\MTProxyAutoSwitchPublic.zip' -Force"
 
 attrib +h release-public\MTProxyAutoSwitchPublic\_internal >nul 2>nul
 

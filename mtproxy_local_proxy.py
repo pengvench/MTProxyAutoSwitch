@@ -51,6 +51,7 @@ SESSION_ID_OFFSET = 44
 SESSION_ID_LEN = 32
 TIMESTAMP_TOLERANCE = 120
 TLS_APPDATA_MAX = 16384
+DEFAULT_FAKE_TLS_DOMAIN = "ya.ru"
 _CCS_FRAME = b"\x14\x03\x03\x00\x01\x01"
 _SERVER_HELLO_TEMPLATE = bytearray(
     b"\x16\x03\x03\x00\x7a"
@@ -303,7 +304,9 @@ class LocalMTProxyServer:
         self.port = port
         self.secret = secret.lower()
         self.fake_tls_enabled = bool(fake_tls_enabled)
-        self.fake_tls_domain = _normalize_fake_tls_domain(fake_tls_domain)
+        self.fake_tls_domain = _normalize_fake_tls_domain(
+            fake_tls_domain or (DEFAULT_FAKE_TLS_DOMAIN if self.fake_tls_enabled else "")
+        )
         self.connect_timeout = connect_timeout
         self.log_sink = log_sink
         self.event_sink = event_sink

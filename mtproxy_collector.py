@@ -30,6 +30,7 @@ DEFAULT_SOURCES = [
     "https://mtproxytg.netlify.app/",
     "https://mtproxytg2.vercel.app/",
     "https://t.me/s/mtpro_xyz",
+    "https://t.me/s/ProxyFree_Ru",
 ]
 
 LIST_DIR_NAME = "list"
