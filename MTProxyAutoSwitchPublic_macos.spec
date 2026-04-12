@@ -1,4 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
+os.environ['MTPROXY_PUBLIC_RELEASE'] = '1'
+
+import tempfile, pathlib
+_hook_code = "import os\nos.environ.setdefault('MTPROXY_PUBLIC_RELEASE', '1')\n"
+_hook_path = pathlib.Path(tempfile.gettempdir()) / "_mtproxy_public_hook.py"
+_hook_path.write_text(_hook_code, encoding="utf-8")
 
 
 a = Analysis(
@@ -29,7 +36,7 @@ a = Analysis(
     ],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=[str(_hook_path)],
     excludes=[
         'win32crypt',
     ],

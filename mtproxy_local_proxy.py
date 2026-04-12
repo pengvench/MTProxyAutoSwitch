@@ -344,6 +344,20 @@ class ProxyPool:
         with self._lock:
             return len(self._states)
 
+    def snapshot_by_key(self, key: tuple) -> dict | None:
+        """Return pool-row dict for a single proxy key, or None if not found."""
+        with self._lock:
+            state = self._states.get(key)
+            if state is None:
+                return None
+            return {
+                "url": state.outcome.proxy.url,
+                "host": state.outcome.proxy.host,
+                "port": state.outcome.proxy.port,
+                "media_score": state.media_score,
+                "deep_media_score": state.counters.deep_media_score,
+            }
+
     def best(self) -> UpstreamProxyState | None:
         items = self.select_candidates(is_media=False, limit=1)
         return items[0] if items else None

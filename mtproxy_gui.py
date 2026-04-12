@@ -2113,6 +2113,30 @@ class SettingsDialog(ctk.CTkToplevel):
     def _on_resize(self, event=None) -> None:
         if event is None or event.widget is self:
             self._refresh_general_layout()
+            self._refresh_wraplengths()
+
+    def _refresh_wraplengths(self) -> None:
+        """Update wraplengths for text labels in all tabs based on current window width."""
+        try:
+            w = self.winfo_width()
+        except Exception:
+            return
+        wrap = max(300, w - 80)
+        labels_to_update = [
+            getattr(self, attr, None)
+            for attr in (
+                "thread_requirement_label",
+                "thread_status_label",
+                "deep_media_requirement_label",
+                "auth_status_label",
+                "auth_storage_label",
+                "update_status_label",
+            )
+        ]
+        for label in labels_to_update:
+            if label is not None:
+                with contextlib.suppress(Exception):
+                    label.configure(wraplength=wrap)
 
     def _refresh_general_layout(self) -> None:
         if not hasattr(self, "general_container"):
@@ -2208,37 +2232,36 @@ class SettingsDialog(ctk.CTkToplevel):
         auth_card = ctk.CTkFrame(outer, corner_radius=22, fg_color=COLOR_CARD, border_width=1, border_color=COLOR_BORDER)
         auth_card.pack(fill="x")
         ctk.CTkLabel(auth_card, text="Авторизация Telegram", font=("Segoe UI Semibold", 16), text_color=COLOR_TEXT).pack(anchor="w", padx=18, pady=(16, 10))
-        if is_public_release():
-            ctk.CTkLabel(
-                auth_card,
-                text="Для Telegram API в public-версии нужны ваши собственные API ID и API Hash.",
-                text_color=COLOR_TEXT_SOFT,
-                font=("Segoe UI", 11),
-                justify="left",
-                wraplength=700,
-            ).pack(anchor="w", padx=18, pady=(0, 8))
-            self._entry_row(auth_card, "API ID", self.telegram_api_id_var)
-            self._entry_row(auth_card, "API Hash", self.telegram_api_hash_var)
-            api_actions = ctk.CTkFrame(auth_card, fg_color="transparent")
-            api_actions.pack(fill="x", padx=18, pady=(0, 10))
-            ctk.CTkLabel(
-                api_actions,
-                text="API ID и API Hash получаются на my.telegram.org/apps",
-                text_color=COLOR_TEXT_SOFT,
-                font=("Segoe UI", 11),
-            ).pack(side="left")
-            self.open_telegram_apps_button = ctk.CTkButton(
-                api_actions,
-                text="Получить API ID / API Hash",
-                width=230,
-                height=36,
-                corner_radius=18,
-                fg_color=COLOR_ACCENT_SOFT,
-                hover_color=COLOR_ACCENT_SOFT_HOVER,
-                text_color=COLOR_ACCENT,
-                command=self._open_telegram_apps_page,
-            )
-            self.open_telegram_apps_button.pack(side="right")
+        ctk.CTkLabel(
+            auth_card,
+            text="Для Telegram API нужны ваши собственные API ID и API Hash.",
+            text_color=COLOR_TEXT_SOFT,
+            font=("Segoe UI", 11),
+            justify="left",
+            wraplength=700,
+        ).pack(anchor="w", padx=18, pady=(0, 8))
+        self._entry_row(auth_card, "API ID", self.telegram_api_id_var)
+        self._entry_row(auth_card, "API Hash", self.telegram_api_hash_var)
+        api_actions = ctk.CTkFrame(auth_card, fg_color="transparent")
+        api_actions.pack(fill="x", padx=18, pady=(0, 10))
+        ctk.CTkLabel(
+            api_actions,
+            text="API ID и API Hash получаются на my.telegram.org/apps",
+            text_color=COLOR_TEXT_SOFT,
+            font=("Segoe UI", 11),
+        ).pack(side="left")
+        self.open_telegram_apps_button = ctk.CTkButton(
+            api_actions,
+            text="Получить API ID / API Hash",
+            width=230,
+            height=36,
+            corner_radius=18,
+            fg_color=COLOR_ACCENT_SOFT,
+            hover_color=COLOR_ACCENT_SOFT_HOVER,
+            text_color=COLOR_ACCENT,
+            command=self._open_telegram_apps_page,
+        )
+        self.open_telegram_apps_button.pack(side="right")
         self._entry_row(auth_card, "Телефон", self.phone_var)
         self._entry_row_with_button(auth_card, "Код", self.code_var, button_text="Запросить код", button_command=self._request_code)
         self._password_entry_row(auth_card, "Пароль 2FA", self.password_var)
@@ -2785,7 +2808,7 @@ class SettingsDialog(ctk.CTkToplevel):
             status_text = "Сессия найдена, но авторизация не подтверждена"
         else:
             status_text = "Сессия Telegram не подключена"
-        if is_public_release() and not (config.telegram_api_id and config.telegram_api_hash.strip()):
+        if not (config.telegram_api_id and config.telegram_api_hash.strip()):
             status_text = "Для входа в Telegram укажите свои API ID и API Hash"
         self.auth_status_label.configure(text=status_text)
         self._refresh_requirement_hints()
@@ -3207,9 +3230,9 @@ class SettingsDialog(ctk.CTkToplevel):
                 payload["local_fake_tls_domain"].encode("ascii")
             if not payload["sources"]:
                 raise ValueError("sources list is empty")
-            if is_public_release() and bool(payload["telegram_sources_enabled"] or payload["deep_media_enabled"] or payload["rf_whitelist_check_enabled"]):
+            if bool(payload["telegram_sources_enabled"] or payload["deep_media_enabled"] or payload["rf_whitelist_check_enabled"]):
                 if not payload["telegram_api_id"] or not payload["telegram_api_hash"]:
-                    raise ValueError("telegram_api_id and telegram_api_hash are required for Telegram features in public release")
+                    raise ValueError("Для функций Telegram необходимо указать API ID и API Hash")
             self.app.apply_config(AppConfig(**payload))
         except Exception as exc:
             messagebox.showerror("Настройки не сохранены", str(exc), parent=self.app)
@@ -3336,9 +3359,8 @@ class SettingsDialog(ctk.CTkToplevel):
             payload["telegram_api_hash"] = self.telegram_api_hash_var.get().strip()
             if payload["local_fake_tls_domain"]:
                 payload["local_fake_tls_domain"].encode("ascii")
-            if is_public_release() and bool(payload["telegram_sources_enabled"] or payload["deep_media_enabled"] or payload["rf_whitelist_check_enabled"]):
-                if not payload["telegram_api_id"] or not payload["telegram_api_hash"]:
-                    raise ValueError("telegram_api_id and telegram_api_hash are required for Telegram features in public release")
+            if not payload["telegram_api_id"] or not payload["telegram_api_hash"]:
+                raise ValueError("Для входа в Telegram необходимо указать API ID и API Hash")
             self.app.apply_config(AppConfig(**payload))
             self.refresh_from_runtime()
             return True

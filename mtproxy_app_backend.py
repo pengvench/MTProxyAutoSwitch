@@ -1086,11 +1086,17 @@ class AppRuntime:
         defaults.update(data)
         return AppConfig(**defaults)
 
-    @staticmethod
-    def _working_priority_key(outcome: ProbeOutcome) -> tuple[float, float, float, str]:
+    def _working_priority_key(self, outcome: ProbeOutcome) -> tuple[float, float, float, float, str]:
         latency = outcome.avg_latency_ms if outcome.avg_latency_ms is not None else 9_999.0
+        # Prefer proxies with high media scores (from deep_media_probe).
+        # A higher deep_media_score means better media download throughput.
+        pool_row = self.pool.snapshot_by_key(outcome.proxy.key)
+        deep_media = pool_row.get("deep_media_score") if pool_row else None
+        # Negative so that higher score sorts first (ascending tuple sort).
+        media_penalty = -float(deep_media) if deep_media is not None else 0.0
         return (
-            latency,
+            media_penalty,       # primary: best media score first (negative → lower = better)
+            latency,             # secondary: lower latency
             -outcome.success_rate,
             outcome.high_latency_ratio,
             outcome.proxy.url,
