@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import statistics
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -83,6 +84,11 @@ logging.getLogger("telethon").setLevel(logging.CRITICAL)
 
 LogSink = Callable[[str], None]
 EventSink = Callable[[str, dict[str, Any]], None]
+
+
+def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("refresh_cancelled")
 
 
 @dataclass
@@ -703,7 +709,12 @@ def classify_probe(
     )
 
 
-async def probe_proxy(proxy: ProxyRecord, settings: ProbeSettings) -> ProbeOutcome:
+async def probe_proxy(
+    proxy: ProxyRecord,
+    settings: ProbeSettings,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> ProbeOutcome:
     started_at = time.perf_counter()
     deadline = started_at + settings.duration
     attempts = 0
@@ -720,6 +731,7 @@ async def probe_proxy(proxy: ProxyRecord, settings: ProbeSettings) -> ProbeOutco
 
     try:
         while True:
+            _raise_if_cancelled(cancel_event)
             if client is None or not client.is_connected():
                 try:
                     client = create_probe_client(proxy, timeout=settings.timeout)
@@ -739,12 +751,14 @@ async def probe_proxy(proxy: ProxyRecord, settings: ProbeSettings) -> ProbeOutco
                         break
                     sleep_for = min(settings.interval, max(0.0, deadline - now))
                     if sleep_for > 0:
+                        _raise_if_cancelled(cancel_event)
                         await asyncio.sleep(sleep_for)
                     continue
 
             request = requests[request_index % len(requests)]
             request_index += 1
             latency_ms = await perform_mtproto_request(client, request, settings.timeout)
+            _raise_if_cancelled(cancel_event)
             attempts += 1
 
             if latency_ms is None:
@@ -777,6 +791,7 @@ async def probe_proxy(proxy: ProxyRecord, settings: ProbeSettings) -> ProbeOutco
                 break
             sleep_for = min(settings.interval, max(0.0, deadline - now))
             if sleep_for > 0:
+                _raise_if_cancelled(cancel_event)
                 await asyncio.sleep(sleep_for)
     finally:
         if client is not None:
@@ -807,6 +822,7 @@ async def probe_all(
     verbose: bool,
     log_sink: LogSink | None,
     event_sink: EventSink | None,
+    cancel_event: threading.Event | None = None,
 ) -> list[ProbeOutcome]:
     semaphore = asyncio.Semaphore(concurrency)
     progress_lock = asyncio.Lock()
@@ -816,8 +832,10 @@ async def probe_all(
 
     async def runner(proxy: ProxyRecord) -> None:
         nonlocal completed
+        _raise_if_cancelled(cancel_event)
         async with semaphore:
-            outcome = await probe_proxy(proxy, settings)
+            _raise_if_cancelled(cancel_event)
+            outcome = await probe_proxy(proxy, settings, cancel_event=cancel_event)
             results.append(outcome)
 
             if verbose:
@@ -846,6 +864,7 @@ async def probe_all(
                 total=total,
             )
 
+    _raise_if_cancelled(cancel_event)
     await asyncio.gather(*(runner(proxy) for proxy in proxies))
     return results
 
@@ -963,6 +982,7 @@ def run_collection(
     log_sink: LogSink | None = None,
     event_sink: EventSink | None = None,
     write_output: bool = True,
+    cancel_event: threading.Event | None = None,
 ) -> CollectorRunResult:
     out_dir = Path(config.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -983,6 +1003,7 @@ def run_collection(
     )
 
     for index, source_url in enumerate(config.sources, start=1):
+        _raise_if_cancelled(cancel_event)
         log(f"[source] {source_url}", verbose=config.verbose, sink=log_sink)
         emit_event(
             event_sink,
@@ -1020,6 +1041,7 @@ def run_collection(
             unique_total=len(registry),
             summary=summary,
         )
+        _raise_if_cancelled(cancel_event)
 
     proxies = sorted(registry.values(), key=lambda item: item.url)
     socks5 = sorted(socks5_registry.values(), key=lambda item: item.url)
@@ -1048,6 +1070,7 @@ def run_collection(
         unreachable_failures=3,
     )
 
+    _raise_if_cancelled(cancel_event)
     outcomes = asyncio.run(
         probe_all(
             proxies=proxies,
@@ -1056,6 +1079,7 @@ def run_collection(
             verbose=config.verbose,
             log_sink=log_sink,
             event_sink=event_sink,
+            cancel_event=cancel_event,
         )
     )
 
@@ -1071,6 +1095,7 @@ def run_collection(
     socks5_all_txt_path = out_dir / SOCKS5_FILE_NAME
     report_json_path = out_dir / REPORT_FILE_NAME
 
+    _raise_if_cancelled(cancel_event)
     if write_output:
         write_text_file(all_txt_path, [proxy.url for proxy in proxies])
         write_text_file(working_txt_path, [item.proxy.url for item in working])

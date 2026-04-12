@@ -5,6 +5,7 @@ import contextlib
 import ctypes
 import datetime
 import re
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,6 +46,11 @@ DEFAULT_SOURCE_MAX_AGE_DAYS = 7
 THREAD_PROGRESS_EVERY = 200
 DEFAULT_QR_TOTAL_TIMEOUT = 90.0
 SESSION_KEY_FILE_NAME = "session_key.bin"
+
+
+def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise RuntimeError("refresh_cancelled")
 
 
 @dataclass
@@ -337,6 +343,7 @@ async def collect_thread_proxies(
     max_messages: int = DEFAULT_THREAD_MAX_MESSAGES,
     max_age_days: int = DEFAULT_SOURCE_MAX_AGE_DAYS,
     event_sink: Any | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> list[ProxyRecord]:
     _ensure_auth_config(config)
     username, thread_id = parse_thread_url(thread_url)
@@ -376,6 +383,7 @@ async def collect_thread_proxies(
 
         iterator = client.iter_messages(entity, reply_to=thread_id, limit=None)
         while True:
+            _raise_if_cancelled(cancel_event)
             if time.perf_counter() >= deadline:
                 timed_out = True
                 break
@@ -454,6 +462,7 @@ async def collect_telegram_source_proxies(
     event_sink: Any | None = None,
     source_index: int = 1,
     total_sources: int = 1,
+    cancel_event: threading.Event | None = None,
 ) -> list[ProxyRecord]:
     _ensure_auth_config(config)
     spec = parse_telegram_source_url(source_url)
@@ -496,6 +505,7 @@ async def collect_telegram_source_proxies(
             with contextlib.suppress(Exception):
                 iterator = client.iter_messages(entity, reply_to=spec.message_id, limit=None)
                 while True:
+                    _raise_if_cancelled(cancel_event)
                     if time.perf_counter() >= deadline:
                         timed_out = True
                         break
@@ -535,6 +545,7 @@ async def collect_telegram_source_proxies(
         else:
             iterator = client.iter_messages(entity, limit=None)
             while True:
+                _raise_if_cancelled(cancel_event)
                 if time.perf_counter() >= deadline:
                     timed_out = True
                     break
@@ -611,10 +622,12 @@ async def collect_telegram_sources_proxies(
     max_messages: int = DEFAULT_THREAD_MAX_MESSAGES,
     max_age_days: int = DEFAULT_SOURCE_MAX_AGE_DAYS,
     event_sink: Any | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> list[ProxyRecord]:
     unique_urls: list[str] = []
     seen_urls: set[str] = set()
     for raw_url in source_urls:
+        _raise_if_cancelled(cancel_event)
         url = str(raw_url).strip()
         if not url or url in seen_urls:
             continue
@@ -629,6 +642,7 @@ async def collect_telegram_sources_proxies(
         max_age_days=max_age_days,
     )
     for index, source_url in enumerate(unique_urls, start=1):
+        _raise_if_cancelled(cancel_event)
         proxies = await collect_telegram_source_proxies(
             source_url,
             config,
@@ -641,9 +655,11 @@ async def collect_telegram_sources_proxies(
             event_sink=event_sink,
             source_index=index,
             total_sources=len(unique_urls),
+            cancel_event=cancel_event,
         )
         for proxy in proxies:
             registry[proxy.key] = proxy
+    _raise_if_cancelled(cancel_event)
     _emit_progress(
         event_sink,
         "telegram_sources_finished",
@@ -716,6 +732,73 @@ async def deep_media_probe(
             proxy.key,
             None,
             f"media_probe_failed:{type(exc).__name__}",
+            round((time.perf_counter() - started_at) * 1000.0, 2),
+        )
+    finally:
+        _save_session(config.session_path, client)
+        await _disconnect_quietly(client)
+
+
+async def light_media_probe(
+    proxy: ProxyRecord,
+    config: TelegramAuthConfig,
+    *,
+    channels: list[str] | None = None,
+) -> MediaProbeResult:
+    _ensure_auth_config(config)
+    started_at = time.perf_counter()
+    client = build_client(config, upstream_proxy=proxy, timeout=10.0)
+    sample_channels = channels or list(DEFAULT_MEDIA_CHANNELS[:2])
+    deadline = time.perf_counter() + 18.0
+
+    try:
+        await _await_timeout(client.connect(), _remaining(deadline, 10.0), "connect")
+        if not await _await_timeout(client.is_user_authorized(), _remaining(deadline, 6.0), "auth_status"):
+            return MediaProbeResult(proxy.key, None, "session_not_authorized", None)
+
+        for username in sample_channels:
+            entity = await _await_timeout(client.get_entity(username), _remaining(deadline, 6.0), "get_entity")
+            iterator = client.iter_messages(entity, limit=15)
+            while True:
+                if time.perf_counter() >= deadline:
+                    raise RuntimeError("light_media_probe_timeout")
+                try:
+                    message = await _await_timeout(iterator.__anext__(), _remaining(deadline, 6.0), "iter_messages")
+                except StopAsyncIteration:
+                    break
+                media_kind = _detect_media_kind(message)
+                if media_kind is None:
+                    continue
+                elapsed_ms, downloaded = await _download_sample_bytes(
+                    client,
+                    message,
+                    max_bytes=96 * 1024,
+                    timeout=_remaining(deadline, 8.0),
+                )
+                if downloaded <= 0:
+                    continue
+
+                score = 1.0
+                if elapsed_ms > 2_800.0:
+                    score = 0.35
+                elif elapsed_ms > 1_800.0:
+                    score = 0.55
+                elif elapsed_ms > 1_000.0:
+                    score = 0.75
+
+                return MediaProbeResult(
+                    proxy.key,
+                    score,
+                    f"{media_kind} ok",
+                    round((time.perf_counter() - started_at) * 1000.0, 2),
+                )
+
+        return MediaProbeResult(proxy.key, None, "no_media_samples_found", None)
+    except Exception as exc:
+        return MediaProbeResult(
+            proxy.key,
+            None,
+            f"light_media_probe_failed:{type(exc).__name__}",
             round((time.perf_counter() - started_at) * 1000.0, 2),
         )
     finally:

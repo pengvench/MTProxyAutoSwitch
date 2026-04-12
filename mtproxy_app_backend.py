@@ -243,7 +243,12 @@ class AppRuntime:
     def stop_local_server(self) -> None:
         self.local_server.stop()
 
-    def run_refresh(self) -> None:
+    @staticmethod
+    def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError("refresh_cancelled")
+
+    def run_refresh(self, *, cancel_event: threading.Event | None = None) -> None:
         self.last_refresh_started_at = time.time()
         self.thread_status = "disabled"
         self.thread_proxy_count = 0
@@ -271,7 +276,9 @@ class AppRuntime:
             log_sink=self._log,
             event_sink=self._emit,
             write_output=False,
+            cancel_event=cancel_event,
         )
+        self._raise_if_cancelled(cancel_event)
         combined_outcomes = list(base_result.outcomes)
         known_keys = {item.proxy.key for item in combined_outcomes}
         best_upstream = next((item.proxy for item in sorted(base_result.working, key=self._working_priority_key)), None)
@@ -287,10 +294,12 @@ class AppRuntime:
                     verbose=False,
                     log_sink=self._log,
                     event_sink=None,
+                    cancel_event=cancel_event,
                 )
             )
             combined_outcomes.extend(manual_outcomes)
             known_keys.update(item.proxy.key for item in manual_outcomes)
+        self._raise_if_cancelled(cancel_event)
 
         telegram_sources = self._collect_enabled_telegram_sources()
         if telegram_sources and best_upstream is not None:
@@ -307,6 +316,7 @@ class AppRuntime:
                             request_timeout=max(8.0, float(self.config.fetch_timeout)),
                             max_messages=max(1500, self.config.max_proxies or 8000),
                             max_age_days=int(self.config.telegram_source_max_age_days or DEFAULT_SOURCE_MAX_AGE_DAYS),
+                            cancel_event=cancel_event,
                         )
                     )
                 self.thread_proxy_count = len(thread_proxies)
@@ -323,6 +333,7 @@ class AppRuntime:
                             verbose=False,
                             log_sink=self._log,
                             event_sink=None,
+                            cancel_event=cancel_event,
                         )
                     )
                     combined_outcomes.extend(extra_outcomes)
@@ -336,6 +347,7 @@ class AppRuntime:
             self.thread_status = "skipped:no_working_upstream"
         else:
             self.thread_status = "disabled"
+        self._raise_if_cancelled(cancel_event)
 
         combined_working = sorted((item for item in combined_outcomes if item.accepted), key=outcome_sort_key)
         combined_rejected = sorted(
@@ -343,22 +355,25 @@ class AppRuntime:
             key=lambda item: (item.reason, outcome_sort_key(item)),
         )
 
-        self.last_result = base_result
-        self.last_outcomes = combined_outcomes
-        self.pool.replace_outcomes(combined_working)
         if (self.config.deep_media_enabled or self.config.rf_whitelist_check_enabled) and combined_working:
             combined_working, combined_rejected = self._run_deep_media_checks(
                 combined_working,
                 combined_rejected,
                 strict=self.config.rf_whitelist_check_enabled,
+                cancel_event=cancel_event,
             )
+        self._raise_if_cancelled(cancel_event)
+        self.last_result = base_result
+        self.last_outcomes = combined_outcomes
         self.last_working = combined_working
         self.last_rejected = combined_rejected
         self.pool.replace_outcomes(combined_working)
 
+        self._raise_if_cancelled(cancel_event)
         self._export_combined_results(base_result, combined_outcomes, combined_working, combined_rejected, existing_list_urls)
         self.last_refresh_finished_at = time.time()
 
+        self._raise_if_cancelled(cancel_event)
         if self.config.auto_start_local and combined_working:
             self.start_local_server()
 
@@ -470,6 +485,7 @@ class AppRuntime:
         rejected: list[ProbeOutcome],
         *,
         strict: bool,
+        cancel_event: threading.Event | None = None,
     ) -> tuple[list[ProbeOutcome], list[ProbeOutcome]]:
         working = sorted(working, key=self._working_priority_key)
         with self.telegram_lock:
@@ -491,6 +507,7 @@ class AppRuntime:
         )
         rejected_keys: set[tuple[str, int, str]] = set()
         for index, outcome in enumerate(top_candidates, start=1):
+            self._raise_if_cancelled(cancel_event)
             with self.telegram_lock:
                 result = asyncio.run(deep_media_probe(outcome.proxy, self.auth_config))
             self.pool.update_deep_media_score(result.proxy_key, result.score, result.note)

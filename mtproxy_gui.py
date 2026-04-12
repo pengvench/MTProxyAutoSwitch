@@ -551,7 +551,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             if APP_ICON_PATH.exists():
                 self.iconbitmap(str(APP_ICON_PATH))
         _center_window(self, 438, 720)
-        self.minsize(360, 560)
+        self.minsize(438, 720)
         self.configure(fg_color=COLOR_BG)
         self.protocol("WM_DELETE_WINDOW", self._on_close_requested)
         self.bind("<F11>", lambda _event: "break")
@@ -565,6 +565,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         }
         self.snapshot_cache: dict[str, object] = {}
         self.refresh_thread: threading.Thread | None = None
+        self.refresh_cancel_event = threading.Event()
         self.refresh_in_progress = False
         self.runtime_call_count = 0
         self.settings_dialog: SettingsDialog | None = None
@@ -737,7 +738,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         self.refresh_phase_total = 0
 
     def _build_layout(self) -> None:
-        shell = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        shell = ctk.CTkFrame(self, fg_color="transparent")
         self.main_shell = shell
         shell.pack(fill="both", expand=True, padx=16, pady=16)
 
@@ -1137,17 +1138,24 @@ class MTProxyAutoSwitchApp(ctk.CTk):
 
             if kind == "refresh_done":
                 self.refresh_in_progress = False
+                self.refresh_cancel_event.clear()
                 refresh_required = True
                 continue
 
             if kind == "refresh_error":
                 self.refresh_in_progress = False
+                self.refresh_cancel_event.clear()
                 refresh_required = True
                 _, message, details = item
-                self._append_log(f"[refresh] failed: {message}")
-                self._append_log(details)
-                self._set_refresh_progress(0.0, f"Ошибка обновления: {message}")
-                self.copy_hint_var.set(f"Refresh error: {message}")
+                if message == "refresh_cancelled":
+                    self._append_log("[refresh] cancelled")
+                    self._set_refresh_progress(0.0, "Обновление отменено")
+                    self.copy_hint_var.set("Обновление отменено")
+                else:
+                    self._append_log(f"[refresh] failed: {message}")
+                    self._append_log(details)
+                    self._set_refresh_progress(0.0, f"Ошибка обновления: {message}")
+                    self.copy_hint_var.set(f"Refresh error: {message}")
                 self.after(5000, lambda: self.copy_hint_var.set(""))
 
         if refresh_required:
@@ -1194,7 +1202,23 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             hover_color=COLOR_DANGER_BORDER if running else COLOR_ACCENT_HOVER,
             border_width=0,
         )
-        self.refresh_button.configure(state="disabled" if ui_busy else "normal")
+        refresh_cancel_requested = self.refresh_cancel_event.is_set()
+        if self.refresh_in_progress:
+            self.refresh_button.configure(
+                text="Отмена..." if refresh_cancel_requested else "Отмена",
+                fg_color=COLOR_DANGER_BG,
+                hover_color=COLOR_DANGER_BORDER,
+                text_color=COLOR_DANGER_TEXT,
+                state="disabled" if refresh_cancel_requested else "normal",
+            )
+        else:
+            self.refresh_button.configure(
+                text="Обновить",
+                fg_color=COLOR_ACCENT_SOFT,
+                hover_color=COLOR_ACCENT_SOFT_HOVER,
+                text_color=COLOR_ACCENT,
+                state="disabled" if ui_busy else "normal",
+            )
         self.open_output_button.configure(state="disabled" if ui_busy else "normal")
         self.copy_button.configure(state="normal" if local_url else "disabled")
         if self.settings_button is not None:
@@ -1207,7 +1231,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
 
         if running:
             self.primary_hint_var.set(f"Telegram можно подключать к {config.local_host}:{config.local_port}")
-        elif ui_busy:
+        elif ui_busy and not self.refresh_in_progress:
             self.primary_hint_var.set("Во время обновления списка, авторизации или установки обновления управление временно заблокировано.")
         elif working_count > 0:
             self.primary_hint_var.set("Пул готов. Кнопка по центру запускает и останавливает локальный frontend.")
@@ -1388,15 +1412,19 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         self._refresh_snapshot()
 
     def start_refresh(self) -> None:
-        if self.refresh_in_progress or self.runtime_call_count > 0 or bool(self.update_info.get("checking")):
+        if self.refresh_in_progress:
+            self.cancel_refresh()
             return
+        if self.runtime_call_count > 0 or bool(self.update_info.get("checking")):
+            return
+        self.refresh_cancel_event.clear()
         self.refresh_in_progress = True
         self._reset_refresh_progress()
         self._refresh_snapshot()
 
         def worker() -> None:
             try:
-                self.runtime.run_refresh()
+                self.runtime.run_refresh(cancel_event=self.refresh_cancel_event)
             except Exception as exc:
                 self.message_queue.put(("refresh_error", str(exc), traceback.format_exc()))
             finally:
@@ -1404,6 +1432,13 @@ class MTProxyAutoSwitchApp(ctk.CTk):
 
         self.refresh_thread = threading.Thread(target=worker, daemon=True, name="mtproxy-refresh")
         self.refresh_thread.start()
+
+    def cancel_refresh(self) -> None:
+        if not self.refresh_in_progress or self.refresh_cancel_event.is_set():
+            return
+        self.refresh_cancel_event.set()
+        self._set_refresh_progress(self.refresh_fraction or 0.01, "Отмена обновления...")
+        self._refresh_snapshot()
 
     def _on_primary_action(self) -> None:
         if self.refresh_in_progress or self.runtime_call_count > 0 or bool(self.update_info.get("checking")):
@@ -1615,34 +1650,23 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             self.thread_info_label.configure(wraplength=wrap)
         if hasattr(self, "footer_info_label"):
             self.footer_info_label.configure(wraplength=wrap)
-        self._refresh_main_layout()
 
     def _refresh_main_layout(self) -> None:
-        width = max(360, self.winfo_width())
-        narrow = width < 500
-
         if hasattr(self, "hero_actions"):
             self.hero_actions.grid_columnconfigure(0, weight=1)
-            self.hero_actions.grid_columnconfigure(1, weight=0 if narrow else 1)
+            self.hero_actions.grid_columnconfigure(1, weight=1)
             self.refresh_button.grid_forget()
             self.open_output_button.grid_forget()
-            if narrow:
-                self.refresh_button.grid(row=0, column=0, sticky="ew", padx=0, pady=(0, 8))
-                self.open_output_button.grid(row=1, column=0, sticky="ew", padx=0, pady=0)
-            else:
-                self.refresh_button.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=0)
-                self.open_output_button.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=0)
+            self.refresh_button.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=0)
+            self.open_output_button.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=0)
 
         if hasattr(self, "summary_cards"):
             self.summary_frame.grid_columnconfigure(0, weight=1)
-            self.summary_frame.grid_columnconfigure(1, weight=0 if narrow else 1)
-            self.summary_frame.grid_columnconfigure(2, weight=0 if narrow else 1)
+            self.summary_frame.grid_columnconfigure(1, weight=1)
+            self.summary_frame.grid_columnconfigure(2, weight=1)
             for index, card in enumerate(self.summary_cards):
                 card.grid_forget()
-                if narrow:
-                    card.grid(row=index, column=0, padx=0, pady=(0, 8), sticky="ew")
-                else:
-                    card.grid(row=0, column=index, padx=4, pady=0, sticky="nsew")
+                card.grid(row=0, column=index, padx=4, pady=0, sticky="nsew")
 
     def _build_tray_image(self) -> Image.Image:
         image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
@@ -1664,7 +1688,9 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             items.append(pystray.MenuItem("Запустить", lambda icon, item: self.after(0, self.start_local_proxy)))
         if not ui_busy and running:
             items.append(pystray.MenuItem("Остановить", lambda icon, item: self.after(0, self.stop_local_proxy)))
-        if not ui_busy:
+        if self.refresh_in_progress:
+            items.append(pystray.MenuItem("Отменить обновление", lambda icon, item: self.after(0, self.cancel_refresh)))
+        elif not ui_busy:
             items.append(pystray.MenuItem("Обновить", lambda icon, item: self.after(0, self.start_refresh)))
         items.append(pystray.MenuItem("Выход", lambda icon, item: self.after(0, lambda: self._quit_application(force=True))))
         return pystray.Menu(*items)
@@ -2214,14 +2240,6 @@ class SettingsDialog(ctk.CTkToplevel):
             )
             self.open_telegram_apps_button.pack(side="right")
         self._entry_row(auth_card, "Телефон", self.phone_var)
-        ctk.CTkLabel(
-            auth_card,
-            text="Поддерживаются форматы +79990000000, 89990000000 и 9990000000 — приложение само приведет номер к +7.",
-            text_color=COLOR_TEXT_FAINT,
-            font=("Segoe UI", 11),
-            justify="left",
-            wraplength=700,
-        ).pack(anchor="w", padx=18, pady=(0, 8))
         self._entry_row_with_button(auth_card, "Код", self.code_var, button_text="Запросить код", button_command=self._request_code)
         self._password_entry_row(auth_card, "Пароль 2FA", self.password_var)
         self.auth_status_label = ctk.CTkLabel(auth_card, text="", text_color=COLOR_TEXT_SOFT, font=("Segoe UI", 12), justify="left", wraplength=700)
@@ -2528,24 +2546,20 @@ class SettingsDialog(ctk.CTkToplevel):
         intro.pack(fill="x", padx=18, pady=(0, 16))
         ctk.CTkLabel(
             intro,
-            text="MTProxy AutoSwitch — форк клиента Flowseal `tg-ws-proxy`. "
-            "Здесь поверх базового локального frontend добавлены парсинг источников, отбор прокси по качеству, "
-            "автопереключение upstream и Telegram-инструменты для сложных сетей.",
+            text="MTProxy AutoSwitch — приложение для сбора, проверки и отбора MTProto-прокси с локальным подключением для Telegram.",
             font=("Segoe UI", 12),
             text_color=COLOR_TEXT,
             justify="left",
             wraplength=620,
-        ).pack(anchor="w", padx=18, pady=(16, 12))
+        ).pack(anchor="w", padx=18, pady=(16, 8))
         ctk.CTkLabel(
             intro,
-            text="Ниже — быстрые ссылки на исходный проект, автора форка и репозиторий сборок. Видео в карточке крутится локально из bundled resources.",
+            text="Ниже размещены ссылки на исходный проект, автора сборки и репозиторий этого форка.",
             font=("Segoe UI", 11),
             text_color=COLOR_TEXT_SOFT,
             justify="left",
             wraplength=620,
-        ).pack(anchor="w", padx=18, pady=(0, 12))
-        self.about_video_preview = LoopingVideoPreview(intro, video_path=ABOUT_VIDEO_PATH, width=420, height=236)
-        self.about_video_preview.pack(fill="x", padx=18, pady=(0, 18))
+        ).pack(anchor="w", padx=18, pady=(0, 16))
 
         self._about_link_row(
             card,
