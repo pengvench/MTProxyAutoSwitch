@@ -1,0 +1,152 @@
+{
+  "generated_at_utc": "2026-04-11T00:00:00Z",
+  "notes": [
+    "Bundled startup pool used to avoid an empty UI on first launch.",
+    "These proxies are only a seed list. The app still needs to refresh and re-check them in background."
+  ],
+  "proxies": [
+    {
+      "url": "https://t.me/proxy?server=144.31.237.90&port=2050&secret=ee3c9444b211c71301559aae25c40bfa506d61782e7275",
+      "host": "144.31.237.90",
+      "port": 2050,
+      "secret": "ee3c9444b211c71301559aae25c40bfa506d61782e7275",
+      "sources": [
+        "https://mtproxy.tg/",
+        "https://mtproxytg.netlify.app/",
+        "https://mtproxytg2.vercel.app/"
+      ],
+      "discovered_from": [
+        "https://mtproxy.tg/",
+        "https://mtproxytg.netlify.app/",
+        "https://mtproxytg2.vercel.app/"
+      ],
+      "accepted": true,
+      "reason": "ok",
+      "attempts": 4,
+      "successes": 4,
+      "failures": 0,
+      "success_rate": 1.0,
+      "avg_latency_ms": 129.26,
+      "p95_latency_ms": 142.97,
+      "min_latency_ms": 121.71,
+      "max_latency_ms": 142.97,
+      "high_latency_ratio": 0.0,
+      "max_consecutive_failures": 0,
+      "max_consecutive_high_latency": 0,
+      "elapsed_seconds": 6.16,
+      "early_stop": null
+    },
+    {
+      "url": "https://t.me/proxy?server=104.238.167.131&port=443&secret=cb3e4c331796df70645d8de629f6999a",
+      "host": "104.238.167.131",
+      "port": 443,
+      "secret": "cb3e4c331796df70645d8de629f6999a",
+      "sources": [
+        "https://hookzof.github.io/mtpro.xyz/mtproto.html"
+      ],
+      "discovered_from": [
+        "https://raw.githubusercontent.com/hookzof/socks5_list/refs/heads/master/tg/mtproto.json"
+      ],
+      "accepted": true,
+      "reason": "ok",
+      "attempts": 2,
+      "successes": 2,
+      "failures": 0,
+      "success_rate": 1.0,
+      "avg_latency_ms": 162.02,
+      "p95_latency_ms": 176.44,
+      "min_latency_ms": 147.61,
+      "max_latency_ms": 176.44,
+      "high_latency_ratio": 0.0,
+      "max_consecutive_failures": 0,
+      "max_consecutive_high_latency": 0,
+      "elapsed_seconds": 6.19,
+      "early_stop": null
+    },
+    {
+      "url": "https://t.me/proxy?server=109.172.95.150&port=2053&secret=dd09bf3c9456c213f4ca556919222e3ce2",
+      "host": "109.172.95.150",
+      "port": 2053,
+      "secret": "dd09bf3c9456c213f4ca556919222e3ce2",
+      "sources": [
+        "https://hookzof.github.io/mtpro.xyz/mtproto.html",
+        "https://mtpro.xyz/mtproto-ru"
+      ],
+      "discovered_from": [
+        "https://mtpro.xyz/api/?type=mtprotoS",
+        "https://raw.githubusercontent.com/hookzof/socks5_list/refs/heads/master/tg/mtproto.json"
+      ],
+      "accepted": true,
+      "reason": "ok",
+      "attempts": 2,
+      "successes": 2,
+      "failures": 0,
+      "success_rate": 1.0,
+      "avg_latency_ms": 177.09,
+      "p95_latency_ms": 178.05,
+      "min_latency_ms": 176.12,
+      "max_latency_ms": 178.05,
+      "high_latency_ratio": 0.0,
+      "max_consecutive_failures": 0,
+      "max_consecutive_high_latency": 0,
+      "elapsed_seconds": 6.19,
+      "early_stop": null
+    },
+    {
+      "url": "https://t.me/proxy?server=109.120.138.205&port=2053&secret=dd74e71178512a5eb063883fd2c7a98db1",
+      "host": "109.120.138.205",
+      "port": 2053,
+      "secret": "dd74e71178512a5eb063883fd2c7a98db1",
+      "sources": [
+        "https://mtpro.xyz/mtproto-ru"
+      ],
+      "discovered_from": [
+        "https://mtpro.xyz/api/?type=mtprotoS"
+      ],
+      "accepted": true,
+      "reason": "ok",
+      "attempts": 2,
+      "successes": 2,
+      "failures": 0,
+      "success_rate": 1.0,
+      "avg_latency_ms": 180.64,
+      "p95_latency_ms": 213.42,
+      "min_latency_ms": 147.87,
+      "max_latency_ms": 213.42,
+      "high_latency_ratio": 0.0,
+      "max_consecutive_failures": 0,
+      "max_consecutive_high_latency": 0,
+      "elapsed_seconds": 6.16,
+      "early_stop": null
+    },
+    {
+      "url": "https://t.me/proxy?server=147.45.71.181&port=2053&secret=ddf24d98c3bf7d6544163769643a621c91",
+      "host": "147.45.71.181",
+      "port": 2053,
+      "secret": "ddf24d98c3bf7d6544163769643a621c91",
+      "sources": [
+        "https://hookzof.github.io/mtpro.xyz/mtproto.html",
+        "https://mtpro.xyz/mtproto-ru"
+      ],
+      "discovered_from": [
+        "https://mtpro.xyz/api/?type=mtprotoS",
+        "https://raw.githubusercontent.com/hookzof/socks5_list/refs/heads/master/tg/mtproto.json"
+      ],
+      "accepted": true,
+      "reason": "ok",
+      "attempts": 2,
+      "successes": 2,
+      "failures": 0,
+      "success_rate": 1.0,
+      "avg_latency_ms": 248.26,
+      "p95_latency_ms": 337.56,
+      "min_latency_ms": 158.95,
+      "max_latency_ms": 337.56,
+      "high_latency_ratio": 0.5,
+      "max_consecutive_failures": 0,
+      "max_consecutive_high_latency": 1,
+      "elapsed_seconds": 6.35,
+      "early_stop": null
+    }
+  ]
+}
