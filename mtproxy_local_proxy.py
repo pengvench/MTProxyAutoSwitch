@@ -90,6 +90,10 @@ class RuntimeCounters:
     media_failures: int = 0
     deep_media_score: float | None = None
     deep_media_note: str = ""
+    consecutive_high_latency: int = 0
+    consecutive_media_failures: int = 0
+    cooldown_until: float = 0.0
+    cooldown_reason: str = ""
 
 
 @dataclass
@@ -168,24 +172,93 @@ class ProxyPool:
         latency_ms: float | None,
         ok: bool,
         reason: str,
-    ) -> None:
+        *,
+        max_latency_ms: float = 300.0,
+        high_latency_streak_limit: int = 3,
+        failure_limit: int = 3,
+        cooldown_seconds: float = 120.0,
+    ) -> str | None:
         with self._lock:
             state = self._states.get(proxy_key)
             if state is None:
-                return
+                return None
+            soft_latency_limit = min(max(80.0, float(max_latency_ms or 300.0)), 150.0)
             if ok and latency_ms is not None:
                 state.counters.live_latency_ms = latency_ms
                 state.counters.recent_successes = min(50, state.counters.recent_successes + 1)
                 state.counters.recent_failures = max(0, state.counters.recent_failures - 1)
                 state.counters.last_success_at = time.time()
+                if latency_ms > soft_latency_limit:
+                    state.counters.consecutive_high_latency += 1
+                    if state.counters.consecutive_high_latency >= max(1, high_latency_streak_limit):
+                        return self._enter_cooldown(
+                            state,
+                            reason=f"high_latency:{int(round(latency_ms))}ms",
+                            cooldown_seconds=cooldown_seconds,
+                        )
+                else:
+                    state.counters.consecutive_high_latency = 0
             else:
                 state.counters.recent_failures = min(50, state.counters.recent_failures + 1)
                 state.counters.last_failure_at = time.time()
                 state.counters.last_error = reason
+                state.counters.consecutive_high_latency = 0
+                if state.counters.recent_failures >= max(1, failure_limit):
+                    return self._enter_cooldown(
+                        state,
+                        reason=reason or "live_probe_failed",
+                        cooldown_seconds=cooldown_seconds,
+                    )
+            return None
+
+    def update_background_media_probe(
+        self,
+        proxy_key: tuple[str, int, str],
+        score: float | None,
+        note: str,
+        *,
+        failure_score: float = 0.6,
+        cooldown_seconds: float = 300.0,
+    ) -> str | None:
+        with self._lock:
+            state = self._states.get(proxy_key)
+            if state is None:
+                return None
+            state.counters.deep_media_score = score
+            state.counters.deep_media_note = note
+            if score is None or score < failure_score:
+                state.counters.consecutive_media_failures += 1
+                return self._enter_cooldown(
+                    state,
+                    reason=f"media:{note or 'failed'}",
+                    cooldown_seconds=cooldown_seconds,
+                )
+            state.counters.consecutive_media_failures = 0
+            return None
 
     def select_candidates(self, *, is_media: bool, limit: int = 5) -> list[UpstreamProxyState]:
         with self._lock:
-            ordered = sorted(self._states.values(), key=lambda item: self._score(item, is_media), reverse=True)
+            candidates = self._available_states()
+            if not candidates:
+                candidates = list(self._states.values())
+            ordered = sorted(candidates, key=lambda item: self._score(item, is_media), reverse=True)
+            return ordered[:limit]
+
+    def select_monitor_targets(self, *, limit: int = 2) -> list[UpstreamProxyState]:
+        with self._lock:
+            candidates = self._available_states()
+            if not candidates:
+                candidates = list(self._states.values())
+            ordered = sorted(
+                candidates,
+                key=lambda item: (
+                    item.counters.active_connections > 0,
+                    item.counters.selected_count,
+                    self._score(item, True),
+                    self._score(item, False),
+                ),
+                reverse=True,
+            )
             return ordered[:limit]
 
     def mark_selected(self, proxy_key: tuple[str, int, str], latency_ms: float | None) -> None:
@@ -237,7 +310,14 @@ class ProxyPool:
     def snapshot(self) -> list[dict[str, Any]]:
         with self._lock:
             rows = []
+            now = time.time()
             for state in sorted(self._states.values(), key=lambda item: self._score(item, False), reverse=True):
+                cooldown_remaining = max(0.0, state.counters.cooldown_until - now)
+                runtime_state = (
+                    f"cooldown {int(round(cooldown_remaining))}s: {state.counters.cooldown_reason}"
+                    if cooldown_remaining > 0
+                    else state.outcome.reason
+                )
                 rows.append(
                     {
                         "key": state.key,
@@ -253,8 +333,8 @@ class ProxyPool:
                         "media_score": state.media_score,
                         "deep_media_score": state.counters.deep_media_score,
                         "deep_media_note": state.counters.deep_media_note,
-                        "last_error": state.counters.last_error,
-                        "reason": state.outcome.reason,
+                        "last_error": state.counters.cooldown_reason or state.counters.last_error,
+                        "reason": runtime_state,
                         "score": round(self._score(state, False), 2),
                     }
                 )
@@ -270,19 +350,49 @@ class ProxyPool:
 
     def _score(self, state: UpstreamProxyState, is_media: bool) -> float:
         base_latency = state.avg_latency_ms
-        score = (state.outcome.success_rate * 1_000.0) - (base_latency * 2.0)
-        score -= state.counters.recent_failures * 90.0
-        score += min(20, state.counters.recent_successes) * 10.0
-        score -= state.counters.active_connections * 15.0
+        success_rate = max(state.outcome.success_rate, state.runtime_success_rate)
+        score = success_rate * 650.0
+        score -= base_latency * 3.6
+        if base_latency > 80.0:
+            score -= (base_latency - 80.0) * 1.2
+        if base_latency > 140.0:
+            score -= (base_latency - 140.0) * 2.4
+        if base_latency > 220.0:
+            score -= (base_latency - 220.0) * 3.2
+        score -= state.counters.recent_failures * 120.0
+        score += min(20, state.counters.recent_successes) * 12.0
+        score -= state.counters.active_connections * 18.0
+
+        media_score = state.media_score
+        if media_score >= 0:
+            score += media_score * (460.0 if is_media else 110.0)
+        elif is_media:
+            score -= 60.0
+
         if state.counters.deep_media_score is not None:
-            score += state.counters.deep_media_score * 220.0
-        if is_media:
-            media_score = state.media_score
-            if media_score >= 0:
-                score += media_score * 260.0
-            else:
-                score -= 40.0
+            score += state.counters.deep_media_score * (240.0 if is_media else 80.0)
+
+        cooldown_remaining = state.counters.cooldown_until - time.time()
+        if cooldown_remaining > 0:
+            score -= 10_000.0 + min(1_000.0, cooldown_remaining)
         return score
+
+    def _available_states(self) -> list[UpstreamProxyState]:
+        now = time.time()
+        return [state for state in self._states.values() if state.counters.cooldown_until <= now]
+
+    def _enter_cooldown(
+        self,
+        state: UpstreamProxyState,
+        *,
+        reason: str,
+        cooldown_seconds: float,
+    ) -> str:
+        until = time.time() + max(30.0, float(cooldown_seconds))
+        state.counters.cooldown_until = max(state.counters.cooldown_until, until)
+        state.counters.cooldown_reason = reason
+        state.counters.last_error = reason
+        return reason
 
 
 class LocalMTProxyServer:

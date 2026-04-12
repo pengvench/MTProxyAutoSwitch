@@ -5,10 +5,15 @@ a = Analysis(
     ['mtproxy_gui.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[
+        ('img/icon.ico', 'img'),
+        ('img/dancecardiscordrtc.mp4', 'img'),
+    ],
     hiddenimports=[
         'customtkinter',
         'darkdetect',
+        'imageio',
+        'imageio_ffmpeg',
         'pystray',
         'qrcode',
         'TelethonFakeTLS',
@@ -23,7 +28,7 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 
-icon_path = 'icon.ico'
+icon_path = 'img/icon.ico'
 
 exe = EXE(
     pyz,

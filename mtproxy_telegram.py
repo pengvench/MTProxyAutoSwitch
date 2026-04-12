@@ -41,6 +41,7 @@ DEFAULT_AUTH_TIMEOUT = 20.0
 DEFAULT_THREAD_TOTAL_TIMEOUT = 90.0
 DEFAULT_THREAD_REQUEST_TIMEOUT = 12.0
 DEFAULT_THREAD_MAX_MESSAGES = 8000
+DEFAULT_SOURCE_MAX_AGE_DAYS = 7
 THREAD_PROGRESS_EVERY = 200
 DEFAULT_QR_TOTAL_TIMEOUT = 90.0
 SESSION_KEY_FILE_NAME = "session_key.bin"
@@ -95,6 +96,26 @@ def parse_telegram_source_url(source_url: str) -> TelegramSourceSpec:
 
 def auth_is_configured(config: TelegramAuthConfig) -> bool:
     return bool(config.api_id and config.api_hash.strip())
+
+
+def normalize_telegram_phone(phone: str) -> str:
+    raw_value = str(phone or "").strip()
+    if not raw_value:
+        return ""
+
+    digits = "".join(ch for ch in raw_value if ch.isdigit())
+    if not digits:
+        return raw_value
+
+    if len(digits) == 11 and digits[0] in {"7", "8"}:
+        return f"+7{digits[1:]}"
+    if len(digits) == 10 and digits[0] == "9":
+        return f"+7{digits}"
+    if raw_value.startswith("+"):
+        return f"+{digits}"
+    if len(digits) >= 10:
+        return f"+{digits}"
+    return digits
 
 
 def build_client(
@@ -159,13 +180,15 @@ async def request_login_code(
     upstream_proxy: ProxyRecord | None = None,
 ) -> dict[str, Any]:
     _ensure_auth_config(config)
+    normalized_phone = normalize_telegram_phone(phone)
     client = build_client(config, upstream_proxy=upstream_proxy, timeout=DEFAULT_AUTH_TIMEOUT)
     try:
         await _await_timeout(client.connect(), DEFAULT_AUTH_TIMEOUT, "connect")
-        sent = await _await_timeout(client.send_code_request(phone), DEFAULT_AUTH_TIMEOUT, "send_code")
+        sent = await _await_timeout(client.send_code_request(normalized_phone), DEFAULT_AUTH_TIMEOUT, "send_code")
         return {
             "phone_code_hash": sent.phone_code_hash,
             "type": type(sent.type).__name__ if sent.type is not None else "",
+            "phone": normalized_phone,
         }
     finally:
         _save_session(config.session_path, client)
@@ -182,12 +205,13 @@ async def complete_login(
     upstream_proxy: ProxyRecord | None = None,
 ) -> dict[str, Any]:
     _ensure_auth_config(config)
+    normalized_phone = normalize_telegram_phone(phone)
     client = build_client(config, upstream_proxy=upstream_proxy, timeout=DEFAULT_AUTH_TIMEOUT)
     try:
         await _await_timeout(client.connect(), DEFAULT_AUTH_TIMEOUT, "connect")
         try:
             await _await_timeout(
-                client.sign_in(phone=phone, code=code, phone_code_hash=phone_code_hash),
+                client.sign_in(phone=normalized_phone, code=code, phone_code_hash=phone_code_hash),
                 DEFAULT_AUTH_TIMEOUT,
                 "sign_in",
             )
@@ -311,6 +335,8 @@ async def collect_thread_proxies(
     total_timeout: float = DEFAULT_THREAD_TOTAL_TIMEOUT,
     request_timeout: float = DEFAULT_THREAD_REQUEST_TIMEOUT,
     max_messages: int = DEFAULT_THREAD_MAX_MESSAGES,
+    max_age_days: int = DEFAULT_SOURCE_MAX_AGE_DAYS,
+    event_sink: Any | None = None,
 ) -> list[ProxyRecord]:
     _ensure_auth_config(config)
     username, thread_id = parse_thread_url(thread_url)
@@ -318,9 +344,20 @@ async def collect_thread_proxies(
     client = build_client(config, upstream_proxy=upstream_proxy, timeout=request_timeout)
     registry: dict[tuple[str, int, str], ProxyRecord] = {}
     deadline = time.perf_counter() + max(5.0, float(total_timeout))
+    cutoff_dt = _source_cutoff_datetime(max_age_days)
     scanned_messages = 0
     timed_out = False
     hit_limit = False
+    hit_age_limit = False
+
+    _emit_progress(
+        event_sink,
+        "telegram_source_started",
+        source=source_url,
+        index=1,
+        total=1,
+        max_age_days=max_age_days,
+    )
 
     try:
         await _await_timeout(client.connect(), _remaining(deadline, request_timeout), "connect")
@@ -333,7 +370,7 @@ async def collect_thread_proxies(
             _remaining(deadline, request_timeout),
             "get_root_message",
         )
-        if root_message is not None:
+        if root_message is not None and not _message_is_older_than(root_message, cutoff_dt):
             for proxy in _extract_message_proxies(root_message, source_url):
                 registry[proxy.key] = proxy
 
@@ -353,6 +390,9 @@ async def collect_thread_proxies(
                 )
             except StopAsyncIteration:
                 break
+            if _message_is_older_than(message, cutoff_dt):
+                hit_age_limit = True
+                break
             scanned_messages += 1
             for proxy in _extract_message_proxies(message, source_url):
                 registry[proxy.key] = proxy
@@ -361,6 +401,17 @@ async def collect_thread_proxies(
                     f"[thread] scanned={scanned_messages} proxies={len(registry)} "
                     f"source={thread_url}"
                 )
+            if scanned_messages % THREAD_PROGRESS_EVERY == 0:
+                _emit_progress(
+                    event_sink,
+                    "telegram_source_progress",
+                    source=source_url,
+                    index=1,
+                    total=1,
+                    scanned_messages=scanned_messages,
+                    proxy_count=len(registry),
+                    max_age_days=max_age_days,
+                )
 
         if log_sink is not None:
             suffix = ""
@@ -368,7 +419,22 @@ async def collect_thread_proxies(
                 suffix = f" partial_timeout_after={scanned_messages}"
             elif hit_limit:
                 suffix = f" partial_limit={max_messages}"
+            elif hit_age_limit:
+                suffix = f" age_limit={max_age_days}d"
             log_sink(f"[thread] {thread_url} -> {len(registry)} proxies{suffix}")
+        _emit_progress(
+            event_sink,
+            "telegram_source_finished",
+            source=source_url,
+            index=1,
+            total=1,
+            scanned_messages=scanned_messages,
+            proxy_count=len(registry),
+            timed_out=timed_out,
+            hit_limit=hit_limit,
+            hit_age_limit=hit_age_limit,
+            max_age_days=max_age_days,
+        )
         return sorted(registry.values(), key=lambda item: item.url)
     finally:
         _save_session(config.session_path, client)
@@ -384,15 +450,30 @@ async def collect_telegram_source_proxies(
     total_timeout: float = DEFAULT_THREAD_TOTAL_TIMEOUT,
     request_timeout: float = DEFAULT_THREAD_REQUEST_TIMEOUT,
     max_messages: int = DEFAULT_THREAD_MAX_MESSAGES,
+    max_age_days: int = DEFAULT_SOURCE_MAX_AGE_DAYS,
+    event_sink: Any | None = None,
+    source_index: int = 1,
+    total_sources: int = 1,
 ) -> list[ProxyRecord]:
     _ensure_auth_config(config)
     spec = parse_telegram_source_url(source_url)
     client = build_client(config, upstream_proxy=upstream_proxy, timeout=request_timeout)
     registry: dict[tuple[str, int, str], ProxyRecord] = {}
     deadline = time.perf_counter() + max(5.0, float(total_timeout))
+    cutoff_dt = _source_cutoff_datetime(max_age_days)
     scanned_messages = 0
     timed_out = False
     hit_limit = False
+    hit_age_limit = False
+
+    _emit_progress(
+        event_sink,
+        "telegram_source_started",
+        source=spec.normalized_url,
+        index=source_index,
+        total=total_sources,
+        max_age_days=max_age_days,
+    )
 
     try:
         await _await_timeout(client.connect(), _remaining(deadline, request_timeout), "connect")
@@ -407,7 +488,7 @@ async def collect_telegram_source_proxies(
                 _remaining(deadline, request_timeout),
                 "get_root_message",
             )
-            if root_message is not None:
+            if root_message is not None and not _message_is_older_than(root_message, cutoff_dt):
                 scanned_messages += 1
                 for proxy in _extract_message_proxies(root_message, spec.normalized_url):
                     registry[proxy.key] = proxy
@@ -429,6 +510,9 @@ async def collect_telegram_source_proxies(
                         )
                     except StopAsyncIteration:
                         break
+                    if _message_is_older_than(message, cutoff_dt):
+                        hit_age_limit = True
+                        break
                     scanned_messages += 1
                     for proxy in _extract_message_proxies(message, spec.normalized_url):
                         registry[proxy.key] = proxy
@@ -436,6 +520,17 @@ async def collect_telegram_source_proxies(
                         log_sink(
                             f"[telegram] scanned={scanned_messages} proxies={len(registry)} "
                             f"source={spec.normalized_url}"
+                        )
+                    if scanned_messages % THREAD_PROGRESS_EVERY == 0:
+                        _emit_progress(
+                            event_sink,
+                            "telegram_source_progress",
+                            source=spec.normalized_url,
+                            index=source_index,
+                            total=total_sources,
+                            scanned_messages=scanned_messages,
+                            proxy_count=len(registry),
+                            max_age_days=max_age_days,
                         )
         else:
             iterator = client.iter_messages(entity, limit=None)
@@ -454,6 +549,9 @@ async def collect_telegram_source_proxies(
                     )
                 except StopAsyncIteration:
                     break
+                if _message_is_older_than(message, cutoff_dt):
+                    hit_age_limit = True
+                    break
                 scanned_messages += 1
                 for proxy in _extract_message_proxies(message, spec.normalized_url):
                     registry[proxy.key] = proxy
@@ -462,6 +560,17 @@ async def collect_telegram_source_proxies(
                         f"[telegram] scanned={scanned_messages} proxies={len(registry)} "
                         f"source={spec.normalized_url}"
                     )
+                if scanned_messages % THREAD_PROGRESS_EVERY == 0:
+                    _emit_progress(
+                        event_sink,
+                        "telegram_source_progress",
+                        source=spec.normalized_url,
+                        index=source_index,
+                        total=total_sources,
+                        scanned_messages=scanned_messages,
+                        proxy_count=len(registry),
+                        max_age_days=max_age_days,
+                    )
 
         if log_sink is not None:
             suffix = ""
@@ -469,7 +578,22 @@ async def collect_telegram_source_proxies(
                 suffix = f" partial_timeout_after={scanned_messages}"
             elif hit_limit:
                 suffix = f" partial_limit={max_messages}"
+            elif hit_age_limit:
+                suffix = f" age_limit={max_age_days}d"
             log_sink(f"[telegram] {spec.normalized_url} -> {len(registry)} proxies{suffix}")
+        _emit_progress(
+            event_sink,
+            "telegram_source_finished",
+            source=spec.normalized_url,
+            index=source_index,
+            total=total_sources,
+            scanned_messages=scanned_messages,
+            proxy_count=len(registry),
+            timed_out=timed_out,
+            hit_limit=hit_limit,
+            hit_age_limit=hit_age_limit,
+            max_age_days=max_age_days,
+        )
         return sorted(registry.values(), key=lambda item: item.url)
     finally:
         _save_session(config.session_path, client)
@@ -485,6 +609,8 @@ async def collect_telegram_sources_proxies(
     total_timeout: float = DEFAULT_THREAD_TOTAL_TIMEOUT,
     request_timeout: float = DEFAULT_THREAD_REQUEST_TIMEOUT,
     max_messages: int = DEFAULT_THREAD_MAX_MESSAGES,
+    max_age_days: int = DEFAULT_SOURCE_MAX_AGE_DAYS,
+    event_sink: Any | None = None,
 ) -> list[ProxyRecord]:
     unique_urls: list[str] = []
     seen_urls: set[str] = set()
@@ -496,7 +622,13 @@ async def collect_telegram_sources_proxies(
         unique_urls.append(url)
 
     registry: dict[tuple[str, int, str], ProxyRecord] = {}
-    for source_url in unique_urls:
+    _emit_progress(
+        event_sink,
+        "telegram_sources_started",
+        total_sources=len(unique_urls),
+        max_age_days=max_age_days,
+    )
+    for index, source_url in enumerate(unique_urls, start=1):
         proxies = await collect_telegram_source_proxies(
             source_url,
             config,
@@ -505,9 +637,20 @@ async def collect_telegram_sources_proxies(
             total_timeout=total_timeout,
             request_timeout=request_timeout,
             max_messages=max_messages,
+            max_age_days=max_age_days,
+            event_sink=event_sink,
+            source_index=index,
+            total_sources=len(unique_urls),
         )
         for proxy in proxies:
             registry[proxy.key] = proxy
+    _emit_progress(
+        event_sink,
+        "telegram_sources_finished",
+        total_sources=len(unique_urls),
+        proxy_count=len(registry),
+        max_age_days=max_age_days,
+    )
     return sorted(registry.values(), key=lambda item: item.url)
 
 
@@ -629,6 +772,28 @@ async def send_proxy_list_to_saved_messages(
 def _ensure_auth_config(config: TelegramAuthConfig) -> None:
     if not auth_is_configured(config):
         raise RuntimeError("telegram_api_credentials_missing")
+
+
+def _emit_progress(event_sink: Any | None, event_name: str, **payload: Any) -> None:
+    if callable(event_sink):
+        event_sink(event_name, payload)
+
+
+def _source_cutoff_datetime(max_age_days: int) -> datetime.datetime | None:
+    if int(max_age_days or 0) <= 0:
+        return None
+    return datetime.datetime.now(tz=datetime.timezone.utc) - datetime.timedelta(days=int(max_age_days))
+
+
+def _message_is_older_than(message: Any, cutoff_dt: datetime.datetime | None) -> bool:
+    if cutoff_dt is None:
+        return False
+    message_date = getattr(message, "date", None)
+    if not isinstance(message_date, datetime.datetime):
+        return False
+    if message_date.tzinfo is None:
+        message_date = message_date.replace(tzinfo=datetime.timezone.utc)
+    return message_date < cutoff_dt
 
 
 def _extract_message_proxies(message: Any, source_url: str) -> list[ProxyRecord]:

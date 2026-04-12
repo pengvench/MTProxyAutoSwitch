@@ -13,6 +13,8 @@ python3 -m pip install --upgrade \
   telethon \
   cryptography \
   pillow \
+  imageio \
+  imageio-ffmpeg \
   pyobjc-core \
   pyobjc-framework-Cocoa \
   pyobjc-framework-Quartz

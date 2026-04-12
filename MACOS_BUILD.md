@@ -33,6 +33,8 @@ TelethonFakeTLS
 telethon
 cryptography
 pillow
+imageio
+imageio-ffmpeg
 pyobjc-core
 pyobjc-framework-Cocoa
 pyobjc-framework-Quartz

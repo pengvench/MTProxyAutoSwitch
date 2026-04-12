@@ -5,10 +5,15 @@ a = Analysis(
     ['mtproxy_gui.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[
+        ('img/icon.ico', 'img'),
+        ('img/dancecardiscordrtc.mp4', 'img'),
+    ],
     hiddenimports=[
         'customtkinter',
         'darkdetect',
+        'imageio',
+        'imageio_ffmpeg',
         'pystray',
         'qrcode',
         'TelethonFakeTLS',

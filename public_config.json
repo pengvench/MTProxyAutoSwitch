@@ -38,6 +38,7 @@
   ],
   "thread_source_enabled": false,
   "thread_source_url": "https://t.me/strbypass/237103",
+  "telegram_source_max_age_days": 7,
   "live_probe_interval_sec": 20,
   "live_probe_duration_sec": 4.0,
   "live_probe_top_n": 12,

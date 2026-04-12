@@ -28,6 +28,7 @@ from mtproxy_collector import (
 )
 from mtproxy_local_proxy import DEFAULT_FAKE_TLS_DOMAIN, LocalMTProxyServer, ProxyPool
 from mtproxy_telegram import (
+    DEFAULT_SOURCE_MAX_AGE_DAYS,
     DEFAULT_TELEGRAM_SOURCE_URLS,
     TelegramAuthConfig,
     collect_telegram_sources_proxies,
@@ -76,6 +77,7 @@ class AppConfig:
     telegram_sources: list[str] = field(default_factory=lambda: list(DEFAULT_TELEGRAM_SOURCE_URLS))
     thread_source_enabled: bool = False
     thread_source_url: str = "https://t.me/strbypass/237103"
+    telegram_source_max_age_days: int = DEFAULT_SOURCE_MAX_AGE_DAYS
     live_probe_interval_sec: int = 20
     live_probe_duration_sec: float = 4.0
     live_probe_top_n: int = 12
@@ -158,8 +160,8 @@ class AppRuntime:
             host=self.config.local_host,
             port=self.config.local_port,
             secret=self.config.local_secret,
-            fake_tls_enabled=self.config.local_fake_tls_enabled,
-            fake_tls_domain=self._effective_fake_tls_domain(self.config.local_fake_tls_enabled, self.config.local_fake_tls_domain),
+            fake_tls_enabled=False,
+            fake_tls_domain="",
             log_sink=self._log,
             event_sink=self._emit,
         )
@@ -210,6 +212,10 @@ class AppRuntime:
         self.config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def apply_config(self, config: AppConfig) -> None:
+        config.local_fake_tls_enabled = False
+        config.local_fake_tls_domain = ""
+        if int(config.telegram_source_max_age_days or 0) <= 0:
+            config.telegram_source_max_age_days = DEFAULT_SOURCE_MAX_AGE_DAYS
         self.config = config
         self.save_config()
         was_running = self.local_server.is_running()
@@ -220,8 +226,8 @@ class AppRuntime:
             host=self.config.local_host,
             port=self.config.local_port,
             secret=self.config.local_secret,
-            fake_tls_enabled=self.config.local_fake_tls_enabled,
-            fake_tls_domain=self._effective_fake_tls_domain(self.config.local_fake_tls_enabled, self.config.local_fake_tls_domain),
+            fake_tls_enabled=False,
+            fake_tls_domain="",
             log_sink=self._log,
             event_sink=self._emit,
         )
@@ -268,7 +274,7 @@ class AppRuntime:
         )
         combined_outcomes = list(base_result.outcomes)
         known_keys = {item.proxy.key for item in combined_outcomes}
-        best_upstream = next((item.proxy for item in base_result.working), None)
+        best_upstream = next((item.proxy for item in sorted(base_result.working, key=self._working_priority_key)), None)
 
         manual_proxies = [item for item in self._load_manual_list_proxies() if item.key not in known_keys]
         if manual_proxies:
@@ -296,9 +302,11 @@ class AppRuntime:
                             self.auth_config,
                             upstream_proxy=best_upstream,
                             log_sink=self._log,
+                            event_sink=self._emit,
                             total_timeout=max(75.0, float(self.config.fetch_timeout) * 6.0),
                             request_timeout=max(8.0, float(self.config.fetch_timeout)),
                             max_messages=max(1500, self.config.max_proxies or 8000),
+                            max_age_days=int(self.config.telegram_source_max_age_days or DEFAULT_SOURCE_MAX_AGE_DAYS),
                         )
                     )
                 self.thread_proxy_count = len(thread_proxies)
@@ -306,6 +314,7 @@ class AppRuntime:
                 new_proxies = [item for item in thread_proxies if item.key not in known_keys]
                 if new_proxies:
                     self._log(f"[telegram] probing {len(new_proxies)} new proxies from Telegram sources")
+                    self._emit("telegram_sources_probing_started", total_proxies=len(new_proxies))
                     extra_outcomes = asyncio.run(
                         probe_all(
                             proxies=new_proxies,
@@ -317,6 +326,7 @@ class AppRuntime:
                         )
                     )
                     combined_outcomes.extend(extra_outcomes)
+                    self._emit("telegram_sources_probing_finished", total_proxies=len(new_proxies))
                 elif thread_proxies:
                     self._log(f"[telegram] sources parsed, all {len(thread_proxies)} proxies were duplicates")
             except Exception as exc:
@@ -335,6 +345,7 @@ class AppRuntime:
 
         self.last_result = base_result
         self.last_outcomes = combined_outcomes
+        self.pool.replace_outcomes(combined_working)
         if (self.config.deep_media_enabled or self.config.rf_whitelist_check_enabled) and combined_working:
             combined_working, combined_rejected = self._run_deep_media_checks(
                 combined_working,
@@ -460,6 +471,7 @@ class AppRuntime:
         *,
         strict: bool,
     ) -> tuple[list[ProbeOutcome], list[ProbeOutcome]]:
+        working = sorted(working, key=self._working_priority_key)
         with self.telegram_lock:
             auth_status = asyncio.run(get_auth_status(self.auth_config, upstream_proxy=self._best_proxy()))
         if not auth_status.get("authorized"):
@@ -472,17 +484,39 @@ class AppRuntime:
             candidate_limit = max(candidate_limit, min(20, max(10, len(working))))
         top_candidates = working[:candidate_limit]
         self._log(f"[media] deep-checking {len(top_candidates)} proxies")
+        self._emit(
+            "deep_media_started",
+            total=len(top_candidates),
+            strict=strict,
+        )
         rejected_keys: set[tuple[str, int, str]] = set()
-        for outcome in top_candidates:
+        for index, outcome in enumerate(top_candidates, start=1):
             with self.telegram_lock:
                 result = asyncio.run(deep_media_probe(outcome.proxy, self.auth_config))
             self.pool.update_deep_media_score(result.proxy_key, result.score, result.note)
             self._log(f"[media] {outcome.proxy.host}:{outcome.proxy.port} -> {result.note}")
+            self._emit(
+                "deep_media_progress",
+                index=index,
+                total=len(top_candidates),
+                host=outcome.proxy.host,
+                port=outcome.proxy.port,
+                score=result.score,
+                note=result.note,
+                strict=strict,
+            )
             if strict and (result.score is None or result.score < 0.75):
                 rejected_keys.add(result.proxy_key)
 
+        self._emit(
+            "deep_media_finished",
+            total=len(top_candidates),
+            strict=strict,
+            rejected=len(rejected_keys),
+        )
+
         if not strict or not rejected_keys:
-            return working, rejected
+            return sorted(working, key=self._working_priority_key), rejected
 
         filtered_working: list[ProbeOutcome] = []
         for outcome in working:
@@ -510,7 +544,7 @@ class AppRuntime:
             else:
                 filtered_working.append(outcome)
 
-        return filtered_working, sorted(
+        return sorted(filtered_working, key=self._working_priority_key), sorted(
             rejected,
             key=lambda item: (item.reason, outcome_sort_key(item)),
         )
@@ -736,10 +770,7 @@ class AppRuntime:
 
     @staticmethod
     def _effective_fake_tls_domain(enabled: bool, domain: str) -> str:
-        value = str(domain or "").strip().lower()
-        if enabled and not value:
-            return DEFAULT_FAKE_TLS_DOMAIN
-        return value
+        return ""
 
     def _load_manual_list_proxies(self) -> list[ProxyRecord]:
         paths = [
@@ -982,8 +1013,21 @@ class AppRuntime:
         if "local_fake_tls_enabled" not in data:
             data["local_fake_tls_enabled"] = False
             normalized = True
+        elif data.get("local_fake_tls_enabled"):
+            data["local_fake_tls_enabled"] = False
+            normalized = True
         if "local_fake_tls_domain" not in data:
             data["local_fake_tls_domain"] = ""
+            normalized = True
+        elif data.get("local_fake_tls_domain"):
+            data["local_fake_tls_domain"] = ""
+            normalized = True
+        try:
+            source_max_age_days = int(data.get("telegram_source_max_age_days") or 0)
+        except (TypeError, ValueError):
+            source_max_age_days = 0
+        if "telegram_source_max_age_days" not in data or source_max_age_days <= 0:
+            data["telegram_source_max_age_days"] = DEFAULT_SOURCE_MAX_AGE_DAYS
             normalized = True
         if "rf_whitelist_check_enabled" not in data:
             data["rf_whitelist_check_enabled"] = False
@@ -1024,6 +1068,16 @@ class AppRuntime:
         defaults = asdict(AppConfig())
         defaults.update(data)
         return AppConfig(**defaults)
+
+    @staticmethod
+    def _working_priority_key(outcome: ProbeOutcome) -> tuple[float, float, float, str]:
+        latency = outcome.avg_latency_ms if outcome.avg_latency_ms is not None else 9_999.0
+        return (
+            latency,
+            -outcome.success_rate,
+            outcome.high_latency_ratio,
+            outcome.proxy.url,
+        )
 
     def _log(self, message: str) -> None:
         if self.log_sink is not None:

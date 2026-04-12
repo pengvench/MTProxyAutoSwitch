@@ -20,6 +20,10 @@ import customtkinter as ctk
 import pystray
 import qrcode
 from PIL import Image, ImageDraw
+try:
+    import imageio.v2 as imageio
+except ImportError:  # pragma: no cover
+    imageio = None
 
 try:
     import winreg
@@ -39,12 +43,31 @@ from mtproxy_app_backend import (
     is_public_release,
 )
 from mtproxy_collector import DEFAULT_SOURCES
-from mtproxy_telegram import DEFAULT_TELEGRAM_SOURCE_URLS
+from mtproxy_telegram import DEFAULT_TELEGRAM_SOURCE_URLS, normalize_telegram_phone
 from mtproxy_updater import APP_PUBLIC_VERSION, fetch_latest_release, is_newer_version, launch_windows_update, prepare_windows_update
 from ui_tooltip import attach_ctk_tooltip
 
 APP_NAME = "MTProxy AutoSwitch"
-APP_ICON_PATH = Path(__file__).resolve().with_name("icon.ico")
+
+
+def _asset_path(*relative_parts: str) -> Path:
+    roots = []
+    if getattr(sys, "frozen", False):
+        roots.append(Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent)))
+        roots.append(Path(sys.executable).resolve().parent)
+    roots.append(Path(__file__).resolve().parent)
+    for root in roots:
+        candidate = root.joinpath(*relative_parts)
+        if candidate.exists():
+            return candidate
+    legacy_candidate = Path(__file__).resolve().with_name(relative_parts[-1])
+    if legacy_candidate.exists():
+        return legacy_candidate
+    return roots[0].joinpath(*relative_parts)
+
+
+APP_ICON_PATH = _asset_path("img", "icon.ico")
+ABOUT_VIDEO_PATH = _asset_path("img", "dancecardiscordrtc.mp4")
 AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 AUTOSTART_VALUE = "MTProxyAutoSwitch"
 CLOSE_LABELS = {
@@ -382,6 +405,91 @@ def _add_help_badge(parent: ctk.CTkFrame, text: str) -> ctk.CTkLabel:
     return badge
 
 
+class LoopingVideoPreview(ctk.CTkFrame):
+    def __init__(self, parent: tk.Misc, *, video_path: Path, width: int = 420, height: int = 236) -> None:
+        super().__init__(parent, corner_radius=22, fg_color=COLOR_FIELD, border_width=1, border_color=COLOR_FIELD_BORDER)
+        self.video_path = video_path
+        self.display_width = width
+        self.display_height = height
+        self.frames: list[ctk.CTkImage] = []
+        self._frame_index = 0
+        self._frame_delay_ms = 70
+        self._frame_job: str | None = None
+
+        self.grid_columnconfigure(0, weight=1)
+        self.video_label = ctk.CTkLabel(self, text="")
+        self.video_label.pack(fill="both", expand=True, padx=10, pady=10)
+        self.status_label = ctk.CTkLabel(
+            self,
+            text="Загрузка preview...",
+            text_color=COLOR_TEXT_SOFT,
+            font=("Segoe UI", 11),
+        )
+        self.status_label.pack(anchor="center", pady=(0, 10))
+
+        if imageio is None:
+            self.status_label.configure(text="Preview недоступен: не установлен imageio")
+        elif not self.video_path.exists():
+            self.status_label.configure(text="Preview не найден")
+        else:
+            self.after(40, self._load_frames)
+
+    def _load_frames(self) -> None:
+        try:
+            pil_frames: list[Image.Image] = []
+            with imageio.get_reader(str(self.video_path)) as reader:
+                meta = reader.get_meta_data() or {}
+                fps = float(meta.get("fps") or 18.0)
+                step = max(1, int(round(fps / 18.0)))
+                for index, frame in enumerate(reader):
+                    if index % step != 0:
+                        continue
+                    image = self._fit_frame(Image.fromarray(frame).convert("RGB"))
+                    pil_frames.append(image)
+                    if len(pil_frames) >= 140:
+                        break
+            if not pil_frames:
+                raise RuntimeError("no_frames")
+            delay_ms = max(40, int(round(1000.0 / min(18.0, max(8.0, fps / step)))))
+            self._set_frames(pil_frames, delay_ms)
+        except Exception:
+            self.status_label.configure(text="Не удалось загрузить preview")
+
+    def _fit_frame(self, frame: Image.Image) -> Image.Image:
+        canvas = Image.new("RGB", (self.display_width, self.display_height), "#101826")
+        prepared = frame.copy()
+        prepared.thumbnail((self.display_width, self.display_height), Image.Resampling.LANCZOS)
+        offset_x = max(0, (self.display_width - prepared.width) // 2)
+        offset_y = max(0, (self.display_height - prepared.height) // 2)
+        canvas.paste(prepared, (offset_x, offset_y))
+        return canvas
+
+    def _set_frames(self, pil_frames: list[Image.Image], delay_ms: int) -> None:
+        self.frames = [
+            ctk.CTkImage(light_image=frame, dark_image=frame, size=(self.display_width, self.display_height))
+            for frame in pil_frames
+        ]
+        self._frame_delay_ms = delay_ms
+        self.status_label.configure(text="")
+        self._play_next()
+
+    def _play_next(self) -> None:
+        self._frame_job = None
+        if not self.frames:
+            return
+        frame = self.frames[self._frame_index]
+        self.video_label.configure(image=frame)
+        self._frame_index = (self._frame_index + 1) % len(self.frames)
+        self._frame_job = self.after(self._frame_delay_ms, self._play_next)
+
+    def destroy(self) -> None:
+        if self._frame_job is not None:
+            with contextlib.suppress(Exception):
+                self.after_cancel(self._frame_job)
+            self._frame_job = None
+        super().destroy()
+
+
 def _telegram_web_hosts_block() -> str:
     lines = [HOSTS_BLOCK_BEGIN, *TELEGRAM_WEB_HOSTS_LINES, HOSTS_BLOCK_END]
     return "\n".join(lines)
@@ -443,8 +551,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             if APP_ICON_PATH.exists():
                 self.iconbitmap(str(APP_ICON_PATH))
         _center_window(self, 438, 720)
-        self.minsize(418, 680)
-        self.maxsize(760, 980)
+        self.minsize(360, 560)
         self.configure(fg_color=COLOR_BG)
         self.protocol("WM_DELETE_WINDOW", self._on_close_requested)
         self.bind("<F11>", lambda _event: "break")
@@ -630,7 +737,8 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         self.refresh_phase_total = 0
 
     def _build_layout(self) -> None:
-        shell = ctk.CTkFrame(self, fg_color="transparent")
+        shell = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        self.main_shell = shell
         shell.pack(fill="both", expand=True, padx=16, pady=16)
 
         top = ctk.CTkFrame(shell, fg_color="transparent")
@@ -691,9 +799,9 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             font=("Segoe UI", 11),
         ).pack(anchor="w", pady=(6, 0))
 
-        hero = ctk.CTkFrame(shell, corner_radius=26, fg_color=COLOR_CARD, border_width=1, border_color=COLOR_BORDER, height=252)
+        hero = ctk.CTkFrame(shell, corner_radius=26, fg_color=COLOR_CARD, border_width=1, border_color=COLOR_BORDER)
         hero.pack(fill="x", pady=(12, 10))
-        hero.pack_propagate(False)
+        self.hero_card = hero
 
         self.primary_button = ctk.CTkButton(
             hero,
@@ -721,6 +829,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
 
         actions = ctk.CTkFrame(hero, fg_color="transparent")
         actions.pack(fill="x", padx=16, pady=(0, 6))
+        self.hero_actions = actions
         actions.grid_columnconfigure((0, 1), weight=1)
         self.refresh_button = ctk.CTkButton(
             actions,
@@ -746,6 +855,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             command=self.open_output_folder,
         )
         self.open_output_button.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        self.main_action_buttons = [self.refresh_button, self.open_output_button]
 
         self.copy_button = ctk.CTkButton(
             shell,
@@ -764,10 +874,13 @@ class MTProxyAutoSwitchApp(ctk.CTk):
 
         summary = ctk.CTkFrame(shell, fg_color="transparent")
         summary.pack(fill="x", pady=(8, 0))
+        self.summary_frame = summary
         summary.grid_columnconfigure((0, 1, 2), weight=1)
-        self._create_stat_card(summary, 0, "Рабочих", self.pool_count_var)
-        self._create_stat_card(summary, 1, "Пинг", self.ping_var)
-        self._create_stat_card(summary, 2, "Источник", self.source_var)
+        self.summary_cards = [
+            self._create_stat_card(summary, 0, "Рабочих", self.pool_count_var),
+            self._create_stat_card(summary, 1, "Пинг", self.ping_var),
+            self._create_stat_card(summary, 2, "Источник", self.source_var),
+        ]
 
         active = ctk.CTkFrame(shell, corner_radius=24, fg_color=COLOR_CARD, border_width=1, border_color=COLOR_BORDER)
         active.pack(fill="both", expand=True, pady=(10, 0))
@@ -805,8 +918,9 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             wraplength=330,
         )
         self.footer_info_label.pack(anchor="w", padx=16, pady=(10, 14))
+        self._refresh_main_layout()
 
-    def _create_stat_card(self, parent: ctk.CTkFrame, column: int, title: str, variable: tk.StringVar) -> None:
+    def _create_stat_card(self, parent: ctk.CTkFrame, column: int, title: str, variable: tk.StringVar) -> ctk.CTkFrame:
         card = ctk.CTkFrame(parent, corner_radius=22, fg_color=COLOR_CARD, border_width=1, border_color=COLOR_BORDER)
         card.grid(row=0, column=column, padx=4, sticky="nsew")
         ctk.CTkLabel(
@@ -821,6 +935,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             text_color=COLOR_TEXT,
             font=("Segoe UI Semibold", 18),
         ).pack(anchor="w", padx=12, pady=(2, 10))
+        return card
 
     def _push_log(self, message: str) -> None:
         self.message_queue.put(("log", message))
@@ -874,8 +989,87 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             self._set_refresh_progress(0.36 + (completed / total) * 0.60, f"Проверка прокси: {completed}/{total}")
             return
 
+        if event_name == "telegram_sources_started":
+            total_sources = max(1, int(payload.get("total_sources", 1)))
+            max_age_days = int(payload.get("max_age_days", 0))
+            suffix = f"  |  последние {max_age_days} дн." if max_age_days > 0 else ""
+            self._set_refresh_progress(0.965, f"Парс Telegram-источников: 0/{total_sources}{suffix}")
+            return
+
+        if event_name == "telegram_source_started":
+            total = max(1, int(payload.get("total", 1)))
+            index = max(1, int(payload.get("index", 1)))
+            source = _trim_middle(str(payload.get("source", "")), 46)
+            self._set_refresh_progress(0.965 + ((index - 1) / total) * 0.01, f"Telegram {index}/{total}: {source}")
+            return
+
+        if event_name == "telegram_source_progress":
+            total = max(1, int(payload.get("total", 1)))
+            index = max(1, int(payload.get("index", 1)))
+            scanned = max(0, int(payload.get("scanned_messages", 0)))
+            proxy_count = max(0, int(payload.get("proxy_count", 0)))
+            source = _trim_middle(str(payload.get("source", "")), 42)
+            self._set_refresh_progress(
+                0.967 + (index / total) * 0.008,
+                f"Telegram {index}/{total}: {scanned} сообщений  |  {proxy_count} proxy  |  {source}",
+            )
+            return
+
+        if event_name == "telegram_source_finished":
+            total = max(1, int(payload.get("total", 1)))
+            index = max(1, int(payload.get("index", 1)))
+            proxy_count = max(0, int(payload.get("proxy_count", 0)))
+            scanned = max(0, int(payload.get("scanned_messages", 0)))
+            suffix = ""
+            if bool(payload.get("hit_age_limit")):
+                suffix = "  |  достигнут лимит по давности"
+            elif bool(payload.get("timed_out")):
+                suffix = "  |  частично по таймауту"
+            elif bool(payload.get("hit_limit")):
+                suffix = "  |  достигнут лимит сообщений"
+            self._set_refresh_progress(0.97 + (index / total) * 0.01, f"Telegram {index}/{total}: {proxy_count} proxy из {scanned} сообщений{suffix}")
+            return
+
+        if event_name == "telegram_sources_finished":
+            proxy_count = max(0, int(payload.get("proxy_count", 0)))
+            self._set_refresh_progress(0.98, f"Парс Telegram завершен: найдено {proxy_count} proxy")
+            return
+
+        if event_name == "telegram_sources_probing_started":
+            total_proxies = max(0, int(payload.get("total_proxies", 0)))
+            self._set_refresh_progress(0.982, f"Допроверка Telegram-proxy: {total_proxies}")
+            return
+
+        if event_name == "telegram_sources_probing_finished":
+            total_proxies = max(0, int(payload.get("total_proxies", 0)))
+            self._set_refresh_progress(0.986, f"Допроверка Telegram-proxy завершена: {total_proxies}")
+            return
+
+        if event_name == "deep_media_started":
+            total = max(1, int(payload.get("total", 1)))
+            mode = "РФ white-list" if bool(payload.get("strict")) else "deep media"
+            self._set_refresh_progress(0.988, f"{mode}: 0/{total}")
+            return
+
+        if event_name == "deep_media_progress":
+            total = max(1, int(payload.get("total", 1)))
+            index = max(1, int(payload.get("index", 1)))
+            host = str(payload.get("host", "") or "")
+            port = str(payload.get("port", "") or "")
+            note = str(payload.get("note", "") or "")
+            mode = "РФ white-list" if bool(payload.get("strict")) else "deep media"
+            label = f"{host}:{port}" if host and port else "proxy"
+            self._set_refresh_progress(0.988 + (index / total) * 0.01, f"{mode}: {index}/{total}  |  {label}  |  {note}")
+            return
+
+        if event_name == "deep_media_finished":
+            mode = "РФ white-list" if bool(payload.get("strict")) else "deep media"
+            rejected = max(0, int(payload.get("rejected", 0)))
+            self._set_refresh_progress(0.998, f"{mode} завершен  |  отклонено {rejected}")
+            return
+
         if event_name == "files_written":
-            self._set_refresh_progress(0.99, "Запись итоговых файлов")
+            self._set_refresh_progress(0.999, "Запись итоговых файлов")
             return
 
         if event_name == "runtime_refresh_complete":
@@ -1421,6 +1615,34 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             self.thread_info_label.configure(wraplength=wrap)
         if hasattr(self, "footer_info_label"):
             self.footer_info_label.configure(wraplength=wrap)
+        self._refresh_main_layout()
+
+    def _refresh_main_layout(self) -> None:
+        width = max(360, self.winfo_width())
+        narrow = width < 500
+
+        if hasattr(self, "hero_actions"):
+            self.hero_actions.grid_columnconfigure(0, weight=1)
+            self.hero_actions.grid_columnconfigure(1, weight=0 if narrow else 1)
+            self.refresh_button.grid_forget()
+            self.open_output_button.grid_forget()
+            if narrow:
+                self.refresh_button.grid(row=0, column=0, sticky="ew", padx=0, pady=(0, 8))
+                self.open_output_button.grid(row=1, column=0, sticky="ew", padx=0, pady=0)
+            else:
+                self.refresh_button.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=0)
+                self.open_output_button.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=0)
+
+        if hasattr(self, "summary_cards"):
+            self.summary_frame.grid_columnconfigure(0, weight=1)
+            self.summary_frame.grid_columnconfigure(1, weight=0 if narrow else 1)
+            self.summary_frame.grid_columnconfigure(2, weight=0 if narrow else 1)
+            for index, card in enumerate(self.summary_cards):
+                card.grid_forget()
+                if narrow:
+                    card.grid(row=index, column=0, padx=0, pady=(0, 8), sticky="ew")
+                else:
+                    card.grid(row=0, column=index, padx=4, pady=0, sticky="nsew")
 
     def _build_tray_image(self) -> Image.Image:
         image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
@@ -1547,15 +1769,18 @@ class SettingsDialog(ctk.CTkToplevel):
         with contextlib.suppress(Exception):
             if APP_ICON_PATH.exists():
                 self.iconbitmap(str(APP_ICON_PATH))
-        _set_fixed_window_size(self, 980, 820)
+        _center_window(self, 920, 760)
+        self.minsize(700, 580)
         self.configure(fg_color=COLOR_BG)
         self.transient(app)
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.bind("<Destroy>", self._on_destroy, add="+")
+        self.bind("<Configure>", self._on_resize, add="+")
 
         self._create_variables()
         self._build_layout()
         self.refresh_from_runtime()
+        self.after(50, self._refresh_general_layout)
         self.after(20, self._show_ready)
 
     def _create_variables(self) -> None:
@@ -1685,15 +1910,19 @@ class SettingsDialog(ctk.CTkToplevel):
         self.save_button.grid(row=0, column=1, sticky="ew", padx=(6, 0))
 
     def _build_general_tab(self, tab: ctk.CTkFrame) -> None:
-        tab.grid_columnconfigure((0, 1), weight=1)
-        container = ctk.CTkFrame(tab, fg_color="transparent")
-        container.pack(fill="both", expand=True, padx=8, pady=12)
+        outer = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        outer.pack(fill="both", expand=True, padx=8, pady=12)
+        container = ctk.CTkFrame(outer, fg_color="transparent")
+        container.pack(fill="both", expand=True)
         container.grid_columnconfigure((0, 1), weight=1)
+        self.general_container = container
 
         left = ctk.CTkFrame(container, corner_radius=22, fg_color=COLOR_CARD, border_width=1, border_color=COLOR_BORDER)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         right = ctk.CTkFrame(container, corner_radius=22, fg_color=COLOR_CARD, border_width=1, border_color=COLOR_BORDER)
         right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
+        self.general_left_card = left
+        self.general_right_card = right
 
         ctk.CTkLabel(left, text="Поведение приложения", font=("Segoe UI Semibold", 16), text_color=COLOR_TEXT).pack(anchor="w", padx=18, pady=(16, 10))
         row = ctk.CTkFrame(left, fg_color="transparent")
@@ -1788,38 +2017,14 @@ class SettingsDialog(ctk.CTkToplevel):
         self._entry_row(right, "Host", self.local_host_var)
         self._entry_row(right, "Port", self.local_port_var)
         self._entry_row(right, "Secret", self.local_secret_var)
-        fake_tls_row = ctk.CTkFrame(right, fg_color="transparent")
-        fake_tls_row.pack(fill="x", padx=18, pady=(2, 8))
-        self.fake_tls_checkbox = ctk.CTkCheckBox(
-            fake_tls_row,
-            text="Включить local Fake TLS listener",
-            variable=self.local_fake_tls_enabled_var,
-            command=self._refresh_fake_tls_controls,
-        )
-        self.fake_tls_checkbox.pack(side="left")
-        _add_help_badge(fake_tls_row, GENERAL_SETTING_TIPS["fake_tls"])
-        self.fake_tls_frame = ctk.CTkFrame(right, fg_color="transparent")
-        preset_row = ctk.CTkFrame(self.fake_tls_frame, fg_color="transparent")
-        preset_row.pack(fill="x", padx=18, pady=(0, 10))
-        ctk.CTkLabel(preset_row, text="Preset", width=100, anchor="w", text_color=COLOR_TEXT_SOFT, font=("Segoe UI", 12)).pack(side="left")
-        self.fake_tls_preset_menu = ctk.CTkOptionMenu(
-            preset_row,
-            values=FAKE_TLS_PRESETS,
-            variable=self.fake_tls_preset_var,
-            width=260,
-            height=36,
-            corner_radius=18,
-            fg_color=COLOR_FIELD,
-            button_color=COLOR_FIELD_BORDER,
-            button_hover_color=COLOR_ACCENT_SOFT_HOVER,
-            dropdown_fg_color=COLOR_CARD,
-            dropdown_hover_color=COLOR_ACCENT_SOFT,
-            text_color=COLOR_TEXT,
-            dropdown_text_color=COLOR_TEXT,
-            command=self._on_fake_tls_preset_selected,
-        )
-        self.fake_tls_preset_menu.pack(side="left", fill="x", expand=True)
-        self._entry_row(self.fake_tls_frame, "Fake TLS domain", self.local_fake_tls_domain_var)
+        ctk.CTkLabel(
+            right,
+            text="Режим local Fake TLS временно отключен: сейчас приложение всегда поднимает обычный локальный MTProto frontend, чтобы не было ложных нерабочих конфигураций.",
+            text_color=COLOR_TEXT_SOFT,
+            font=("Segoe UI", 11),
+            justify="left",
+            wraplength=320,
+        ).pack(anchor="w", padx=18, pady=(2, 10))
         self.regenerate_secret_button = ctk.CTkButton(
             right,
             text="Сгенерировать новый secret",
@@ -1832,7 +2037,6 @@ class SettingsDialog(ctk.CTkToplevel):
             command=self._regenerate_secret,
         )
         self.regenerate_secret_button.pack(anchor="w", padx=18, pady=(6, 18))
-        self._refresh_fake_tls_controls()
 
         ctk.CTkLabel(right, text="Telegram Web", font=("Segoe UI Semibold", 16), text_color=COLOR_TEXT).pack(anchor="w", padx=18, pady=(8, 10))
         ctk.CTkLabel(
@@ -1879,6 +2083,25 @@ class SettingsDialog(ctk.CTkToplevel):
             command=self._remove_hosts_block,
         )
         self.remove_hosts_button.grid(row=0, column=2, sticky="ew", padx=(4, 0))
+
+    def _on_resize(self, event=None) -> None:
+        if event is None or event.widget is self:
+            self._refresh_general_layout()
+
+    def _refresh_general_layout(self) -> None:
+        if not hasattr(self, "general_container"):
+            return
+        narrow = self.winfo_width() < 940
+        self.general_container.grid_columnconfigure(0, weight=1)
+        self.general_container.grid_columnconfigure(1, weight=0 if narrow else 1)
+        self.general_left_card.grid_forget()
+        self.general_right_card.grid_forget()
+        if narrow:
+            self.general_left_card.grid(row=0, column=0, sticky="nsew", padx=0, pady=(0, 12))
+            self.general_right_card.grid(row=1, column=0, sticky="nsew", padx=0, pady=0)
+        else:
+            self.general_left_card.grid(row=0, column=0, sticky="nsew", padx=(0, 8), pady=0)
+            self.general_right_card.grid(row=0, column=1, sticky="nsew", padx=(8, 0), pady=0)
 
     def _build_telegram_tab(self, tab: ctk.CTkFrame) -> None:
         outer = ctk.CTkScrollableFrame(tab, fg_color="transparent")
@@ -1991,6 +2214,14 @@ class SettingsDialog(ctk.CTkToplevel):
             )
             self.open_telegram_apps_button.pack(side="right")
         self._entry_row(auth_card, "Телефон", self.phone_var)
+        ctk.CTkLabel(
+            auth_card,
+            text="Поддерживаются форматы +79990000000, 89990000000 и 9990000000 — приложение само приведет номер к +7.",
+            text_color=COLOR_TEXT_FAINT,
+            font=("Segoe UI", 11),
+            justify="left",
+            wraplength=700,
+        ).pack(anchor="w", padx=18, pady=(0, 8))
         self._entry_row_with_button(auth_card, "Код", self.code_var, button_text="Запросить код", button_command=self._request_code)
         self._password_entry_row(auth_card, "Пароль 2FA", self.password_var)
         self.auth_status_label = ctk.CTkLabel(auth_card, text="", text_color=COLOR_TEXT_SOFT, font=("Segoe UI", 12), justify="left", wraplength=700)
@@ -2007,7 +2238,7 @@ class SettingsDialog(ctk.CTkToplevel):
 
         buttons = ctk.CTkFrame(auth_card, fg_color="transparent")
         buttons.pack(fill="x", padx=18, pady=(0, 18))
-        buttons.grid_columnconfigure((0, 1, 2), weight=1)
+        buttons.grid_columnconfigure((0, 1), weight=1)
         self.auth_check_button = ctk.CTkButton(
             buttons,
             text="Проверить",
@@ -2293,17 +2524,28 @@ class SettingsDialog(ctk.CTkToplevel):
         card = ctk.CTkFrame(outer, corner_radius=22, fg_color=COLOR_CARD, border_width=1, border_color=COLOR_BORDER)
         card.pack(fill="x", pady=(0, 12))
         ctk.CTkLabel(card, text="О приложении", font=("Segoe UI Semibold", 16), text_color=COLOR_TEXT).pack(anchor="w", padx=18, pady=(16, 10))
+        intro = ctk.CTkFrame(card, corner_radius=20, fg_color=COLOR_FIELD, border_width=1, border_color=COLOR_FIELD_BORDER)
+        intro.pack(fill="x", padx=18, pady=(0, 16))
         ctk.CTkLabel(
-            card,
+            intro,
             text="MTProxy AutoSwitch — форк клиента Flowseal `tg-ws-proxy`. "
-            "В оригинальном проекте основной сценарий — локальный proxy frontend. "
-            "В этом форке добавлены парсинг источников, проверка качества MTProto-прокси, "
-            "авто-подбор upstream и локальный auto-switch runtime.",
+            "Здесь поверх базового локального frontend добавлены парсинг источников, отбор прокси по качеству, "
+            "автопереключение upstream и Telegram-инструменты для сложных сетей.",
+            font=("Segoe UI", 12),
+            text_color=COLOR_TEXT,
+            justify="left",
+            wraplength=620,
+        ).pack(anchor="w", padx=18, pady=(16, 12))
+        ctk.CTkLabel(
+            intro,
+            text="Ниже — быстрые ссылки на исходный проект, автора форка и репозиторий сборок. Видео в карточке крутится локально из bundled resources.",
             font=("Segoe UI", 11),
             text_color=COLOR_TEXT_SOFT,
             justify="left",
-            wraplength=860,
-        ).pack(anchor="w", padx=18, pady=(0, 16))
+            wraplength=620,
+        ).pack(anchor="w", padx=18, pady=(0, 12))
+        self.about_video_preview = LoopingVideoPreview(intro, video_path=ABOUT_VIDEO_PATH, width=420, height=236)
+        self.about_video_preview.pack(fill="x", padx=18, pady=(0, 18))
 
         self._about_link_row(
             card,
@@ -2311,6 +2553,7 @@ class SettingsDialog(ctk.CTkToplevel):
             body="Базовый клиент, на основе которого сделан этот форк.",
             link_text="https://github.com/Flowseal/tg-ws-proxy",
             url="https://github.com/Flowseal/tg-ws-proxy",
+            button_attr="author_origin_button",
         )
         self._about_link_row(
             card,
@@ -2318,6 +2561,7 @@ class SettingsDialog(ctk.CTkToplevel):
             body="Для меня было бы очень приятно, если бы вы подписались.",
             link_text="https://t.me/peppe_poppo",
             url="https://t.me/peppe_poppo",
+            button_attr="author_user_button",
         )
         self._about_link_row(
             card,
@@ -2337,24 +2581,25 @@ class SettingsDialog(ctk.CTkToplevel):
         link_text: str,
         url: str,
         last: bool = False,
+        button_attr: str | None = None,
     ) -> None:
-        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row = ctk.CTkFrame(parent, corner_radius=18, fg_color=COLOR_FIELD, border_width=1, border_color=COLOR_FIELD_BORDER)
         row.pack(fill="x", padx=18, pady=(0, 10 if last else 12))
         ctk.CTkLabel(
             row,
             text=title,
-            font=("Segoe UI Semibold", 13),
+            font=("Segoe UI Semibold", 14),
             text_color=COLOR_TEXT,
-        ).pack(anchor="w")
+        ).pack(anchor="w", padx=14, pady=(14, 0))
         ctk.CTkLabel(
             row,
             text=body,
             font=("Segoe UI", 11),
             text_color=COLOR_TEXT_SOFT,
             justify="left",
-            wraplength=860,
-        ).pack(anchor="w", pady=(4, 8))
-        ctk.CTkButton(
+            wraplength=620,
+        ).pack(anchor="w", padx=14, pady=(4, 10))
+        button = ctk.CTkButton(
             row,
             text=link_text,
             height=38,
@@ -2364,7 +2609,10 @@ class SettingsDialog(ctk.CTkToplevel):
             text_color=COLOR_ACCENT,
             anchor="w",
             command=lambda target=url: webbrowser.open(target),
-        ).pack(fill="x")
+        )
+        button.pack(fill="x", padx=14, pady=(0, 14))
+        if button_attr:
+            setattr(self, button_attr, button)
 
     def _entry_row(
         self,
@@ -2733,17 +2981,17 @@ class SettingsDialog(ctk.CTkToplevel):
 
             if is_authorized:
                 self.auth_check_button.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=(0, 0))
-                self.auth_logout_button.grid(row=0, column=1, sticky="ew", padx=6, pady=(0, 0))
-                self.auth_send_list_button.grid(row=0, column=2, sticky="ew", padx=(6, 0), pady=(0, 0))
+                self.auth_logout_button.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=(0, 0))
+                self.auth_send_list_button.grid(row=1, column=0, columnspan=2, sticky="ew", padx=0, pady=(8, 0))
                 self.auth_check_button.configure(state="disabled" if busy else "normal")
                 self.auth_logout_button.configure(state="disabled" if busy else "normal")
                 self.auth_send_list_button.configure(
                     state="disabled" if (busy or int(self.app.snapshot_cache.get("working_count", 0)) <= 0) else "normal"
                 )
             else:
-                self.auth_check_button.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=(0, 8))
-                self.auth_qr_button.grid(row=0, column=1, sticky="ew", padx=6, pady=(0, 8))
-                self.auth_login_button.grid(row=0, column=2, sticky="ew", padx=(6, 0), pady=(0, 8))
+                self.auth_check_button.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=(0, 0))
+                self.auth_qr_button.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=(0, 0))
+                self.auth_login_button.grid(row=1, column=0, columnspan=2, sticky="ew", padx=0, pady=(8, 0))
                 self.auth_check_button.configure(state="disabled" if busy else "normal")
                 self.auth_qr_button.configure(state="disabled" if busy else "normal")
                 self.auth_login_button.configure(state="disabled" if busy else "normal")
@@ -2912,10 +3160,8 @@ class SettingsDialog(ctk.CTkToplevel):
             payload["local_host"] = self.local_host_var.get().strip() or "127.0.0.1"
             payload["local_port"] = _read_int(self.local_port_var.get(), "local_port")
             payload["local_secret"] = self.local_secret_var.get().strip().lower()
-            payload["local_fake_tls_enabled"] = bool(self.local_fake_tls_enabled_var.get())
-            payload["local_fake_tls_domain"] = self.local_fake_tls_domain_var.get().strip().lower()
-            if payload["local_fake_tls_enabled"] and not payload["local_fake_tls_domain"]:
-                payload["local_fake_tls_domain"] = DEFAULT_FAKE_TLS_DOMAIN
+            payload["local_fake_tls_enabled"] = False
+            payload["local_fake_tls_domain"] = ""
             payload["telegram_sources_enabled"] = bool(self.telegram_sources_enabled_var.get())
             payload["telegram_sources"] = self._collect_telegram_sources_from_controls()
             payload["thread_source_enabled"] = payload["telegram_sources_enabled"]
@@ -2974,22 +3220,26 @@ class SettingsDialog(ctk.CTkToplevel):
     def _request_code(self) -> None:
         if not self._save_before_auth():
             return
-        phone = self.phone_var.get().strip()
-        if not phone:
-            messagebox.showerror("Телефон не указан", "Введите телефон в формате +79990000000", parent=self.app)
+        phone = normalize_telegram_phone(self.phone_var.get())
+        digits = "".join(ch for ch in phone if ch.isdigit())
+        if not phone or len(digits) < 11:
+            messagebox.showerror("Телефон не указан", "Введите телефон в формате +79990000000, 89990000000 или 9990000000", parent=self.app)
             return
+        self.phone_var.set(phone)
         self.auth_status_label.configure(text="Запрос кода авторизации...")
         self.app.request_auth_code(phone, callback=lambda _: messagebox.showinfo("Telegram", "Код отправлен", parent=self.app))
 
     def _complete_auth(self) -> None:
         if not self._save_before_auth():
             return
-        phone = self.phone_var.get().strip()
+        phone = normalize_telegram_phone(self.phone_var.get())
+        digits = "".join(ch for ch in phone if ch.isdigit())
         code = self.code_var.get().strip()
         password = self.password_var.get().strip()
-        if not phone or not code:
+        if not phone or len(digits) < 11 or not code:
             messagebox.showerror("Нет данных", "Нужны телефон и код подтверждения", parent=self.app)
             return
+        self.phone_var.set(phone)
         self.auth_status_label.configure(text="Выполняется вход в Telegram...")
         self.app.complete_auth(
             phone,
@@ -3058,10 +3308,8 @@ class SettingsDialog(ctk.CTkToplevel):
             payload["local_host"] = self.local_host_var.get().strip() or "127.0.0.1"
             payload["local_port"] = _read_int(self.local_port_var.get(), "local_port")
             payload["local_secret"] = self.local_secret_var.get().strip().lower()
-            payload["local_fake_tls_enabled"] = bool(self.local_fake_tls_enabled_var.get())
-            payload["local_fake_tls_domain"] = self.local_fake_tls_domain_var.get().strip().lower()
-            if payload["local_fake_tls_enabled"] and not payload["local_fake_tls_domain"]:
-                payload["local_fake_tls_domain"] = DEFAULT_FAKE_TLS_DOMAIN
+            payload["local_fake_tls_enabled"] = False
+            payload["local_fake_tls_domain"] = ""
             payload["telegram_sources_enabled"] = bool(self.telegram_sources_enabled_var.get())
             payload["telegram_sources"] = self._collect_telegram_sources_from_controls()
             payload["thread_source_enabled"] = payload["telegram_sources_enabled"]
@@ -3113,7 +3361,8 @@ class QRAuthDialog(ctk.CTkToplevel):
         with contextlib.suppress(Exception):
             if APP_ICON_PATH.exists():
                 self.iconbitmap(str(APP_ICON_PATH))
-        _set_fixed_window_size(self, 420, 620)
+        _center_window(self, 440, 690)
+        self.minsize(380, 520)
         self.transient(parent)
         self.grab_set()
         self.configure(fg_color=COLOR_BG)
@@ -3121,7 +3370,9 @@ class QRAuthDialog(ctk.CTkToplevel):
         self.bind("<Destroy>", self._on_destroy, add="+")
         self.after(40, self._bring_to_front)
 
-        card = ctk.CTkFrame(self, corner_radius=24, fg_color=COLOR_CARD, border_width=1, border_color=COLOR_BORDER)
+        self.scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        self.scroll.pack(fill="both", expand=True, padx=14, pady=14)
+        card = ctk.CTkFrame(self.scroll, corner_radius=24, fg_color=COLOR_CARD, border_width=1, border_color=COLOR_BORDER)
         card.pack(fill="both", expand=True, padx=18, pady=18)
 
         ctk.CTkLabel(card, text="QR вход Telegram", text_color=COLOR_TEXT, font=("Segoe UI Semibold", 18)).pack(anchor="w", padx=18, pady=(18, 6))
@@ -3230,6 +3481,7 @@ class QRAuthDialog(ctk.CTkToplevel):
         self.password_hint_label.configure(text="Telegram запросил пароль 2FA. Введите пароль и нажмите продолжить.")
         if not self.password_wrap.winfo_manager():
             self.password_wrap.pack(fill="x", padx=18, pady=(4, 0))
+            self.after(30, self._scroll_to_bottom)
         with contextlib.suppress(Exception):
             settings_dialog = self.app.settings_dialog
             if settings_dialog is not None and settings_dialog.winfo_exists():
@@ -3303,6 +3555,12 @@ class QRAuthDialog(ctk.CTkToplevel):
             self.focus_force()
             self.attributes("-topmost", True)
             self.after(300, lambda: self.attributes("-topmost", False))
+
+    def _scroll_to_bottom(self) -> None:
+        canvas = getattr(self.scroll, "_parent_canvas", None)
+        if canvas is not None:
+            with contextlib.suppress(Exception):
+                canvas.yview_moveto(1.0)
 
     def close(self) -> None:
         self._cancel_countdown()
