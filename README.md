@@ -68,9 +68,4 @@ release-macos/MTProxyAutoSwitchPublic/MTProxyAutoSwitchPublic.app
 
 Detailed macOS notes are in `MACOS_BUILD.md`.
 
-## Notes
 
-- This folder is intended for public publishing.
-- Telegram API keys are intentionally not embedded here.
-- `config.json` starts with empty Telegram API credentials.
-- Build the macOS `.app` on macOS, not on Windows.
