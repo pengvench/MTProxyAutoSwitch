@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import ctypes
 import json
@@ -25,6 +24,7 @@ from mtproxy_collector import (
     parse_proxy_link,
     probe_all,
     run_collection,
+    run_async,
 )
 from mtproxy_local_proxy import DEFAULT_FAKE_TLS_DOMAIN, LocalMTProxyServer, ProxyPool
 from mtproxy_telegram import (
@@ -176,6 +176,7 @@ class AppRuntime:
         self.seed_loaded_at: float = 0.0
         self.thread_status: str = "not_checked"
         self.thread_proxy_count: int = 0
+        self._latest_deep_media_scores: dict[tuple[str, int, str], tuple[float | None, str]] = {}
         self.telegram_lock = threading.RLock()
         self._load_initial_pool()
         self.live_probe_stop = threading.Event()
@@ -252,6 +253,7 @@ class AppRuntime:
         self.last_refresh_started_at = time.time()
         self.thread_status = "disabled"
         self.thread_proxy_count = 0
+        self._latest_deep_media_scores = {}
         existing_list_urls = self._read_existing_proxy_list_urls()
         self._write_url_list(self._persistent_proxy_cache_path(), existing_list_urls)
         config = CollectorConfig(
@@ -286,7 +288,7 @@ class AppRuntime:
         manual_proxies = [item for item in self._load_manual_list_proxies() if item.key not in known_keys]
         if manual_proxies:
             self._log(f"[manual-list] probing {len(manual_proxies)} proxies from existing list")
-            manual_outcomes = asyncio.run(
+            manual_outcomes = run_async(
                 probe_all(
                     proxies=manual_proxies,
                     settings=self._probe_settings(),
@@ -305,7 +307,7 @@ class AppRuntime:
         if telegram_sources and best_upstream is not None:
             try:
                 with self.telegram_lock:
-                    thread_proxies = asyncio.run(
+                    thread_proxies = run_async(
                         collect_telegram_sources_proxies(
                             telegram_sources,
                             self.auth_config,
@@ -325,7 +327,7 @@ class AppRuntime:
                 if new_proxies:
                     self._log(f"[telegram] probing {len(new_proxies)} new proxies from Telegram sources")
                     self._emit("telegram_sources_probing_started", total_proxies=len(new_proxies))
-                    extra_outcomes = asyncio.run(
+                    extra_outcomes = run_async(
                         probe_all(
                             proxies=new_proxies,
                             settings=self._probe_settings(),
@@ -368,6 +370,7 @@ class AppRuntime:
         self.last_working = combined_working
         self.last_rejected = combined_rejected
         self.pool.replace_outcomes(combined_working)
+        self._apply_latest_deep_media_scores()
 
         self._raise_if_cancelled(cancel_event)
         self._export_combined_results(base_result, combined_outcomes, combined_working, combined_rejected, existing_list_urls)
@@ -386,11 +389,11 @@ class AppRuntime:
 
     def run_auth_status(self) -> dict[str, Any]:
         with self.telegram_lock:
-            return asyncio.run(get_auth_status(self.auth_config, upstream_proxy=self._best_proxy()))
+            return run_async(get_auth_status(self.auth_config, upstream_proxy=self._best_proxy()))
 
     def request_auth_code(self, phone: str) -> dict[str, Any]:
         with self.telegram_lock:
-            result = asyncio.run(
+            result = run_async(
                 request_login_code(
                     self.auth_config,
                     phone=phone,
@@ -404,7 +407,7 @@ class AppRuntime:
         if not self._auth_code_hash:
             raise RuntimeError("phone_code_hash_missing")
         with self.telegram_lock:
-            result = asyncio.run(
+            result = run_async(
                 complete_login(
                     self.auth_config,
                     phone=phone,
@@ -420,11 +423,11 @@ class AppRuntime:
 
     def logout_auth(self) -> None:
         with self.telegram_lock:
-            asyncio.run(logout(self.auth_config, upstream_proxy=self._best_proxy()))
+            run_async(logout(self.auth_config, upstream_proxy=self._best_proxy()))
 
     def run_qr_login(self, *, password: str = "") -> dict[str, Any]:
         with self.telegram_lock:
-            return asyncio.run(
+            return run_async(
                 qr_login_flow(
                     self.auth_config,
                     upstream_proxy=self._best_proxy(),
@@ -436,7 +439,7 @@ class AppRuntime:
     def send_working_proxies_to_saved_messages(self) -> dict[str, Any]:
         urls = [item.proxy.url for item in self.last_working]
         with self.telegram_lock:
-            return asyncio.run(
+            return run_async(
                 send_proxy_list_to_saved_messages(
                     self.auth_config,
                     urls,
@@ -489,7 +492,7 @@ class AppRuntime:
     ) -> tuple[list[ProbeOutcome], list[ProbeOutcome]]:
         working = sorted(working, key=self._working_priority_key)
         with self.telegram_lock:
-            auth_status = asyncio.run(get_auth_status(self.auth_config, upstream_proxy=self._best_proxy()))
+            auth_status = run_async(get_auth_status(self.auth_config, upstream_proxy=self._best_proxy()))
         if not auth_status.get("authorized"):
             reason = "rf_whitelist" if strict else "deep_media"
             self._log(f"[media] skipped: telegram_session_not_authorized ({reason})")
@@ -509,7 +512,8 @@ class AppRuntime:
         for index, outcome in enumerate(top_candidates, start=1):
             self._raise_if_cancelled(cancel_event)
             with self.telegram_lock:
-                result = asyncio.run(deep_media_probe(outcome.proxy, self.auth_config))
+                result = run_async(deep_media_probe(outcome.proxy, self.auth_config))
+            self._latest_deep_media_scores[result.proxy_key] = (result.score, result.note)
             self.pool.update_deep_media_score(result.proxy_key, result.score, result.note)
             self._log(f"[media] {outcome.proxy.host}:{outcome.proxy.port} -> {result.note}")
             self._emit(
@@ -611,7 +615,7 @@ class AppRuntime:
             high_latency_streak=5,
             unreachable_failures=2,
         )
-        outcomes = asyncio.run(
+        outcomes = run_async(
             probe_all(
                 proxies=[item.proxy for item in candidates],
                 settings=settings,
@@ -654,7 +658,7 @@ class AppRuntime:
         target = candidates[0]
         try:
             with self.telegram_lock:
-                result = asyncio.run(light_media_probe(target.proxy, self.auth_config))
+                result = run_async(light_media_probe(target.proxy, self.auth_config))
         except Exception as exc:
             self._log(f"[media-bg] probe error for {target.proxy.host}:{target.proxy.port} -> {exc}")
             return
@@ -759,6 +763,10 @@ class AppRuntime:
             row["deep_media_score"] = extra["deep_media_score"]
             row["deep_media_note"] = extra["deep_media_note"]
         return rows
+
+    def _apply_latest_deep_media_scores(self) -> None:
+        for proxy_key, (score, note) in self._latest_deep_media_scores.items():
+            self.pool.update_deep_media_score(proxy_key, score, note)
 
     def _best_proxy(self):
         best = self.pool.best()
@@ -1088,15 +1096,19 @@ class AppRuntime:
 
     def _working_priority_key(self, outcome: ProbeOutcome) -> tuple[float, float, float, float, str]:
         latency = outcome.avg_latency_ms if outcome.avg_latency_ms is not None else 9_999.0
-        # Prefer proxies with high media scores (from deep_media_probe).
-        # A higher deep_media_score means better media download throughput.
         pool_row = self.pool.snapshot_by_key(outcome.proxy.key)
-        deep_media = pool_row.get("deep_media_score") if pool_row else None
-        # Negative so that higher score sorts first (ascending tuple sort).
-        media_penalty = -float(deep_media) if deep_media is not None else 0.0
+        latest_media = self._latest_deep_media_scores.get(outcome.proxy.key)
+        media_score = latest_media[0] if latest_media is not None else None
+        if media_score is None and pool_row:
+            media_score = pool_row.get("deep_media_score")
+        if media_score is None and pool_row:
+            fallback_media = pool_row.get("media_score")
+            if fallback_media is not None and float(fallback_media) >= 0.0:
+                media_score = float(fallback_media)
+        media_penalty = -float(media_score) if media_score is not None else 0.0
         return (
-            media_penalty,       # primary: best media score first (negative → lower = better)
-            latency,             # secondary: lower latency
+            media_penalty,
+            latency,
             -outcome.success_rate,
             outcome.high_latency_ratio,
             outcome.proxy.url,

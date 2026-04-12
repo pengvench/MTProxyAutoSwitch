@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import html
 import json
 import logging
 import re
 import statistics
+import sys
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -89,6 +91,23 @@ EventSink = Callable[[str, dict[str, Any]], None]
 def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
     if cancel_event is not None and cancel_event.is_set():
         raise RuntimeError("refresh_cancelled")
+
+
+def run_async(coro):
+    if sys.platform == "win32" and hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
+        loop = asyncio.WindowsSelectorEventLoopPolicy().new_event_loop()
+    else:
+        loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(coro)
+    finally:
+        with contextlib.suppress(Exception):
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        with contextlib.suppress(Exception):
+            loop.run_until_complete(loop.shutdown_default_executor())
+        asyncio.set_event_loop(None)
+        loop.close()
 
 
 @dataclass
@@ -651,6 +670,28 @@ async def perform_mtproto_request(
         return None
 
 
+async def disconnect_probe_client(client: TelegramClient, timeout: float) -> None:
+    try:
+        await asyncio.wait_for(client.disconnect(), timeout=timeout)
+    except Exception:
+        return
+    background_tasks = [
+        task
+        for task in (
+            getattr(client, "_updates_handle", None),
+            getattr(client, "_keepalive_handle", None),
+        )
+        if task is not None
+    ]
+    if background_tasks:
+        with contextlib.suppress(Exception):
+            await asyncio.wait(background_tasks, timeout=timeout)
+    disconnected = getattr(client, "disconnected", None)
+    if disconnected is not None:
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(disconnected, timeout=timeout)
+
+
 def classify_probe(
     proxy: ProxyRecord,
     latencies_ms: list[float],
@@ -737,6 +778,9 @@ async def probe_proxy(
                     client = create_probe_client(proxy, timeout=settings.timeout)
                     await asyncio.wait_for(client.connect(), timeout=settings.timeout)
                 except Exception:
+                    if client is not None:
+                        with contextlib.suppress(Exception):
+                            await disconnect_probe_client(client, settings.timeout)
                     failures += 1
                     attempts += 1
                     consecutive_failures += 1
@@ -767,7 +811,7 @@ async def probe_proxy(
                 max_consecutive_failures = max(max_consecutive_failures, consecutive_failures)
                 consecutive_high_latency = 0
                 try:
-                    await asyncio.wait_for(client.disconnect(), timeout=settings.timeout)
+                    await disconnect_probe_client(client, settings.timeout)
                 except Exception:
                     pass
                 client = None
@@ -796,7 +840,7 @@ async def probe_proxy(
     finally:
         if client is not None:
             try:
-                await asyncio.wait_for(client.disconnect(), timeout=settings.timeout)
+                await disconnect_probe_client(client, settings.timeout)
             except Exception:
                 pass
 
@@ -1071,7 +1115,7 @@ def run_collection(
     )
 
     _raise_if_cancelled(cancel_event)
-    outcomes = asyncio.run(
+    outcomes = run_async(
         probe_all(
             proxies=proxies,
             settings=settings,

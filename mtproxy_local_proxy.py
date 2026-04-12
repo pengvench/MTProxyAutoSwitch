@@ -379,12 +379,12 @@ class ProxyPool:
 
         media_score = state.media_score
         if media_score >= 0:
-            score += media_score * (460.0 if is_media else 110.0)
+            score += media_score * (2400.0 if is_media else 1800.0)
         elif is_media:
-            score -= 60.0
+            score -= 160.0
 
         if state.counters.deep_media_score is not None:
-            score += state.counters.deep_media_score * (240.0 if is_media else 80.0)
+            score += state.counters.deep_media_score * (3200.0 if is_media else 2600.0)
 
         cooldown_remaining = state.counters.cooldown_until - time.time()
         if cooldown_remaining > 0:

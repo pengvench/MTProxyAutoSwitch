@@ -1,5 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
+import imageio_ffmpeg
+ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
 os.environ['MTPROXY_PUBLIC_RELEASE'] = '1'
 
 # Write a minimal runtime hook inline so no external file is needed
@@ -11,7 +13,7 @@ _hook_path.write_text(_hook_code, encoding="utf-8")
 a = Analysis(
     ['mtproxy_gui.py'],
     pathex=[],
-    binaries=[],
+    binaries=[(ffmpeg_exe, '.')],
     datas=[
         ('img/icon.ico', 'img'),
         ('img/dancecardiscordrtc.mp4', 'img'),
@@ -20,10 +22,16 @@ a = Analysis(
         'customtkinter',
         'darkdetect',
         'imageio',
+	'imageio.plugins.ffmpeg',
         'imageio_ffmpeg',
         'pystray',
         'qrcode',
         'TelethonFakeTLS',
+        'telethon',
+        'cryptography',
+        'PIL',
+        'PIL.Image',
+        'PIL.ImageTk',
         'win32crypt',
     ],
     hookspath=[],

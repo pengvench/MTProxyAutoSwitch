@@ -3,7 +3,7 @@ setlocal
 
 cd /d "%~dp0"
 
-python -m pip install --upgrade pyinstaller customtkinter darkdetect pystray qrcode TelethonFakeTLS cryptography pillow
+python -m pip install --upgrade pyinstaller customtkinter darkdetect pystray qrcode TelethonFakeTLS cryptography pillow imageio imageio-ffmpeg pywin32
 python -m pip install telethon==1.42.0
 
 if exist build rmdir /s /q build
@@ -19,7 +19,7 @@ copy /Y README.mtproxy.md release-public\MTProxyAutoSwitchPublic\README.txt >nul
 if exist list mkdir release-public\MTProxyAutoSwitchPublic\list
 if exist list\proxy_list.txt copy /Y list\proxy_list.txt release-public\MTProxyAutoSwitchPublic\list\proxy_list.txt >nul
 if exist list\report.json copy /Y list\report.json release-public\MTProxyAutoSwitchPublic\list\report.json >nul
-if exist icon.ico copy /Y icon.ico release-public\MTProxyAutoSwitchPublic\icon.ico >nul
+if exist img\icon.ico copy /Y img\icon.ico release-public\MTProxyAutoSwitchPublic\icon.ico >nul
 copy /Y public_config.json release-public\MTProxyAutoSwitchPublic\config.json >nul
 if exist release-public\MTProxyAutoSwitchPublic.zip del /f /q release-public\MTProxyAutoSwitchPublic.zip
 powershell -NoProfile -Command "Compress-Archive -Path 'release-public\\MTProxyAutoSwitchPublic\\*' -DestinationPath 'release-public\\MTProxyAutoSwitchPublic.zip' -Force"
