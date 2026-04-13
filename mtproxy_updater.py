@@ -10,12 +10,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-APP_PUBLIC_VERSION = "1.0"
+APP_PUBLIC_VERSION = "1.2"
 GITHUB_REPO = "pengvench/MTProxyAutoSwitch"
 LATEST_RELEASE_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 LATEST_RELEASE_PAGE_URL = f"https://github.com/{GITHUB_REPO}/releases/latest"
 PUBLIC_WINDOWS_ASSET = "MTProxyAutoSwitchPublic.zip"
-USER_AGENT = "MTProxyAutoSwitchUpdater/1.0"
+USER_AGENT = "MTProxyAutoSwitchUpdater/1.2"
 
 
 @dataclass(frozen=True)

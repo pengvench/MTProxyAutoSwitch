@@ -332,9 +332,6 @@ def _bind_clipboard_shortcuts(widget: object, *, readonly: bool = False) -> None
         return "break"
 
     def _paste(_event=None):
-        # Проверяем состояние виджета В МОМЕНТ события, а не при биндинге.
-        # readonly, захваченный при создании, мог устареть если виджет
-        # позже стал disabled (refresh, авторизация и т.д.).
         try:
             current_state = str(target.cget("state"))
         except Exception:
@@ -353,8 +350,6 @@ def _bind_clipboard_shortcuts(widget: object, *, readonly: bool = False) -> None
                     target.delete("sel.first", "sel.last")
                 target.insert("insert", text)
             else:
-                # Entry: явно выставляем state=normal перед insert
-                # на случай если CustomTkinter не синхронизировал inner-виджет
                 try:
                     target.configure(state="normal")
                 except Exception:
@@ -392,18 +387,26 @@ def _bind_clipboard_shortcuts(widget: object, *, readonly: bool = False) -> None
         ("<Control-A>", _select_all),
         ("<Control-Key-a>", _select_all),
         ("<Control-Key-A>", _select_all),
+        ("<Control-ф>", _select_all),
+        ("<Control-Ф>", _select_all),
         ("<Control-c>", _copy),
         ("<Control-C>", _copy),
         ("<Control-Key-c>", _copy),
         ("<Control-Key-C>", _copy),
+        ("<Control-с>", _copy),
+        ("<Control-С>", _copy),
         ("<Control-x>", _cut),
         ("<Control-X>", _cut),
         ("<Control-Key-x>", _cut),
         ("<Control-Key-X>", _cut),
+        ("<Control-ч>", _cut),
+        ("<Control-Ч>", _cut),
         ("<Control-v>", _paste),
         ("<Control-V>", _paste),
         ("<Control-Key-v>", _paste),
         ("<Control-Key-V>", _paste),
+        ("<Control-м>", _paste),
+        ("<Control-М>", _paste),
         ("<<Copy>>", _copy),
         ("<<Cut>>", _cut),
         ("<<Paste>>", _paste),
@@ -431,6 +434,7 @@ def _add_help_badge(parent: ctk.CTkFrame, text: str) -> ctk.CTkLabel:
     return badge
 
 
+# ─── FIX: максимум 60 кадров вместо 140, явный сброс при destroy ─────────────
 class LoopingVideoPreview(ctk.CTkFrame):
     def __init__(self, parent: tk.Misc, *, video_path: Path, width: int = 420, height: int = 236) -> None:
         super().__init__(parent, corner_radius=22, fg_color=COLOR_FIELD, border_width=1, border_color=COLOR_FIELD_BORDER)
@@ -441,6 +445,7 @@ class LoopingVideoPreview(ctk.CTkFrame):
         self._frame_index = 0
         self._frame_delay_ms = 70
         self._frame_job: str | None = None
+        self._destroyed = False
 
         self.grid_columnconfigure(0, weight=1)
         self.video_label = ctk.CTkLabel(self, text="")
@@ -461,6 +466,8 @@ class LoopingVideoPreview(ctk.CTkFrame):
             self.after(40, self._load_frames)
 
     def _load_frames(self) -> None:
+        if self._destroyed:
+            return
         import os as _os, sys as _sys, pathlib as _pl
         if getattr(_sys, "frozen", False) and "IMAGEIO_FFMPEG_EXE" not in _os.environ:
             _meipass = _pl.Path(_sys._MEIPASS)
@@ -474,23 +481,25 @@ class LoopingVideoPreview(ctk.CTkFrame):
             with imageio.get_reader(str(self.video_path)) as reader:
                 meta = reader.get_meta_data() or {}
                 fps = float(meta.get("fps") or 18.0)
-                step = max(1, int(round(fps / 18.0)))
+                # Увеличиваем step чтобы ограничить число кадров до ~60
+                step = max(1, int(round(fps / 15.0)))
                 for index, frame in enumerate(reader):
                     if index % step != 0:
                         continue
                     image = self._fit_frame(Image.fromarray(frame).convert("RGB"))
                     pil_frames.append(image)
-                    if len(pil_frames) >= 140:
+                    if len(pil_frames) >= 60:   # FIX: было 140
                         break
             if not pil_frames:
                 raise RuntimeError("no_frames")
-            delay_ms = max(40, int(round(1000.0 / min(18.0, max(8.0, fps / step)))))
-            self._set_frames(pil_frames, delay_ms)
+            delay_ms = max(50, int(round(1000.0 / min(15.0, max(8.0, fps / step)))))
+            if not self._destroyed:
+                self._set_frames(pil_frames, delay_ms)
         except Exception:
-            self.status_label.configure(text="Не удалось загрузить preview")
+            if not self._destroyed:
+                self.status_label.configure(text="Не удалось загрузить preview")
 
     def _fit_frame(self, frame: Image.Image) -> Image.Image:
-        # cover: заполняем всю область, обрезая лишнее по краям (без чёрных полос)
         frame_ratio = frame.width / frame.height
         display_ratio = self.display_width / self.display_height
         if frame_ratio > display_ratio:
@@ -515,7 +524,7 @@ class LoopingVideoPreview(ctk.CTkFrame):
 
     def _play_next(self) -> None:
         self._frame_job = None
-        if not self.frames:
+        if self._destroyed or not self.frames:
             return
         frame = self.frames[self._frame_index]
         self.video_label.configure(image=frame)
@@ -523,10 +532,13 @@ class LoopingVideoPreview(ctk.CTkFrame):
         self._frame_job = self.after(self._frame_delay_ms, self._play_next)
 
     def destroy(self) -> None:
+        self._destroyed = True
         if self._frame_job is not None:
             with contextlib.suppress(Exception):
                 self.after_cancel(self._frame_job)
             self._frame_job = None
+        # Явно освобождаем PIL/tk PhotoImage объекты
+        self.frames.clear()
         super().destroy()
 
 
@@ -632,7 +644,9 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         self._build_layout()
         self._refresh_snapshot()
         self.bind("<Configure>", self._on_window_resize)
-        self._bind_global_clipboard_shortcuts()
+        # FIX: убраны bind_all clipboard shortcuts — они конфликтовали с локальными
+        # обработчиками в SettingsDialog (двойной paste, блокировка вставки).
+        # Все entry/textbox уже имеют _bind_clipboard_shortcuts вызванным индивидуально.
 
         self.after(180, self._process_messages)
         self.after(600, self.refresh_auth_status)
@@ -646,82 +660,6 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         if self.runtime.config.autostart_enabled != autostart_enabled:
             self.runtime.config.autostart_enabled = autostart_enabled
             self.runtime.save_config()
-
-    def _bind_global_clipboard_shortcuts(self) -> None:
-        for sequence, action in (
-            ("<Control-Key-a>", "select_all"),
-            ("<Control-Key-A>", "select_all"),
-            ("<Control-Key-c>", "copy"),
-            ("<Control-Key-C>", "copy"),
-            ("<Control-Key-x>", "cut"),
-            ("<Control-Key-X>", "cut"),
-            ("<Control-Key-v>", "paste"),
-            ("<Control-Key-V>", "paste"),
-        ):
-            self.bind_all(sequence, lambda event, action=action: self._handle_global_clipboard_action(action, event), add="+")
-
-    def _handle_global_clipboard_action(self, action: str, _event=None):
-        widget = self.focus_get()
-        if widget is None:
-            return
-        # Разворачиваем обёртки CustomTkinter до внутреннего tk-виджета,
-        # иначе isinstance(widget, tk.Entry/Text) возвращает False
-        for _attr in ("_entry", "_textbox"):
-            _inner = getattr(widget, _attr, None)
-            if _inner is not None:
-                widget = _inner
-                break
-        try:
-            widget_state = str(widget.cget("state"))
-        except Exception:
-            widget_state = "normal"
-        readonly = widget_state in {"disabled", "readonly"}
-
-        try:
-            if isinstance(widget, tk.Text):
-                if action == "select_all":
-                    widget.tag_add("sel", "1.0", "end-1c")
-                elif action == "copy":
-                    text = widget.get("sel.first", "sel.last")
-                    self.clipboard_clear()
-                    self.clipboard_append(text)
-                elif action == "cut" and not readonly:
-                    text = widget.get("sel.first", "sel.last")
-                    self.clipboard_clear()
-                    self.clipboard_append(text)
-                    widget.delete("sel.first", "sel.last")
-                elif action == "paste" and not readonly:
-                    text = str(self.clipboard_get())
-                    if widget.tag_ranges("sel"):
-                        widget.delete("sel.first", "sel.last")
-                    widget.insert("insert", text)
-                else:
-                    return
-                return "break"
-
-            if isinstance(widget, tk.Entry):
-                if action == "select_all":
-                    widget.select_range(0, "end")
-                    widget.icursor("end")
-                elif action == "copy":
-                    text = widget.selection_get()
-                    self.clipboard_clear()
-                    self.clipboard_append(text)
-                elif action == "cut" and not readonly:
-                    text = widget.selection_get()
-                    self.clipboard_clear()
-                    self.clipboard_append(text)
-                    widget.delete("sel.first", "sel.last")
-                elif action == "paste" and not readonly:
-                    text = str(self.clipboard_get())
-                    if widget.selection_present():
-                        widget.delete("sel.first", "sel.last")
-                    widget.insert(widget.index("insert"), text)
-                else:
-                    return
-                return "break"
-        except Exception:
-            return
 
     def _apply_appearance(self) -> None:
         mode = self.runtime.config.appearance if self.runtime.config.appearance in APPEARANCE_LABELS else "auto"
@@ -1527,10 +1465,9 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             except tk.TclError:
                 self.settings_dialog = None
             self.settings_dialog = None
+        # FIX: создаём диалог и больше не вызываем deiconify/lift/focus_force здесь,
+        # CTkToplevel сам показывается — дополнительный вызов создавал мигание.
         self.settings_dialog = SettingsDialog(self)
-        self.settings_dialog.deiconify()
-        self.settings_dialog.lift()
-        self.settings_dialog.focus_force()
 
     def apply_config(self, config: AppConfig) -> None:
         previous_appearance = self.runtime.config.appearance
@@ -1833,7 +1770,9 @@ class MTProxyAutoSwitchApp(ctk.CTk):
 class SettingsDialog(ctk.CTkToplevel):
     def __init__(self, app: MTProxyAutoSwitchApp) -> None:
         super().__init__(app)
+        self.withdraw()  # скрыть до инициализации — убирает мигание
         self.app = app
+        self._resize_job: str | None = None   # FIX: для дебаунса resize
         self.title("Настройки")
         with contextlib.suppress(Exception):
             if APP_ICON_PATH.exists():
@@ -1849,7 +1788,22 @@ class SettingsDialog(ctk.CTkToplevel):
         self._build_layout()
         self.refresh_from_runtime()
         self.after(50, self._refresh_general_layout)
-        self.after(20, self._show_ready)
+        # FIX: убран after(20, self._show_ready) — он вызывал двойной deiconify/lift,
+        # из-за чего окно мигало и открывалось "несколько раз".
+        # CTkToplevel сам управляет видимостью при создании.
+
+    # FIX: дебаунс resize — обновляем layout не чаще чем раз в 80ms
+    def _on_resize(self, event=None) -> None:
+        if event is None or event.widget is self:
+            if self._resize_job is not None:
+                with contextlib.suppress(Exception):
+                    self.after_cancel(self._resize_job)
+            self._resize_job = self.after(80, self._do_deferred_resize)
+
+    def _do_deferred_resize(self) -> None:
+        self._resize_job = None
+        self._refresh_general_layout()
+        self._refresh_wraplengths()
 
     def _create_variables(self) -> None:
         config = self.app.runtime.config
@@ -2146,13 +2100,7 @@ class SettingsDialog(ctk.CTkToplevel):
         )
         self.remove_hosts_button.grid(row=0, column=2, sticky="ew", padx=(4, 0))
 
-    def _on_resize(self, event=None) -> None:
-        if event is None or event.widget is self:
-            self._refresh_general_layout()
-            self._refresh_wraplengths()
-
     def _refresh_wraplengths(self) -> None:
-        """Update wraplengths for text labels in all tabs based on current window width."""
         try:
             w = self.winfo_width()
         except Exception:
@@ -3377,6 +3325,17 @@ class SettingsDialog(ctk.CTkToplevel):
             return False
 
     def _close(self) -> None:
+        # FIX: явно останавливаем видео-виджет при закрытии окна
+        video_widget = getattr(self, "about_video_preview", None)
+        if video_widget is not None:
+            with contextlib.suppress(Exception):
+                video_widget.destroy()
+            self.about_video_preview = None
+        # Отменяем отложенный resize если есть
+        if self._resize_job is not None:
+            with contextlib.suppress(Exception):
+                self.after_cancel(self._resize_job)
+            self._resize_job = None
         self._clear_auth_inputs()
         self.app.settings_dialog = None
         self.destroy()
@@ -3384,12 +3343,6 @@ class SettingsDialog(ctk.CTkToplevel):
     def _on_destroy(self, event=None) -> None:
         if event is None or event.widget is self:
             self.app.settings_dialog = None
-
-    def _show_ready(self) -> None:
-        with contextlib.suppress(Exception):
-            self.deiconify()
-            self.lift()
-            self.focus_force()
 
 
 class QRAuthDialog(ctk.CTkToplevel):
