@@ -23,7 +23,10 @@ from PIL import Image, ImageDraw
 try:
     import imageio.v2 as imageio
 except ImportError:  # pragma: no cover
-    imageio = None
+    try:
+        import imageio
+    except ImportError:
+        imageio = None
 
 try:
     import winreg
@@ -329,13 +332,41 @@ def _bind_clipboard_shortcuts(widget: object, *, readonly: bool = False) -> None
         return "break"
 
     def _paste(_event=None):
-        if readonly:
+        # Проверяем состояние виджета В МОМЕНТ события, а не при биндинге.
+        # readonly, захваченный при создании, мог устареть если виджет
+        # позже стал disabled (refresh, авторизация и т.д.).
+        try:
+            current_state = str(target.cget("state"))
+        except Exception:
+            current_state = "normal"
+        if current_state in {"disabled", "readonly"} or readonly:
             return "break"
         try:
             text = str(target.clipboard_get())
-            _insert_text(text)
         except Exception:
             return "break"
+        if not text:
+            return "break"
+        try:
+            if _is_text_widget():
+                if target.tag_ranges("sel"):
+                    target.delete("sel.first", "sel.last")
+                target.insert("insert", text)
+            else:
+                # Entry: явно выставляем state=normal перед insert
+                # на случай если CustomTkinter не синхронизировал inner-виджет
+                try:
+                    target.configure(state="normal")
+                except Exception:
+                    pass
+                try:
+                    if target.selection_present():
+                        target.delete("sel.first", "sel.last")
+                except Exception:
+                    pass
+                target.insert("insert", text)
+        except Exception:
+            pass
         return "break"
 
     def _show_context_menu(event=None):
@@ -430,6 +461,14 @@ class LoopingVideoPreview(ctk.CTkFrame):
             self.after(40, self._load_frames)
 
     def _load_frames(self) -> None:
+        import os as _os, sys as _sys, pathlib as _pl
+        if getattr(_sys, "frozen", False) and "IMAGEIO_FFMPEG_EXE" not in _os.environ:
+            _meipass = _pl.Path(_sys._MEIPASS)
+            for _pat in ("ffmpeg*.exe", "ffmpeg*"):
+                _c = sorted(_meipass.glob(_pat))
+                if _c:
+                    _os.environ["IMAGEIO_FFMPEG_EXE"] = str(_c[0])
+                    break
         try:
             pil_frames: list[Image.Image] = []
             with imageio.get_reader(str(self.video_path)) as reader:
@@ -451,13 +490,19 @@ class LoopingVideoPreview(ctk.CTkFrame):
             self.status_label.configure(text="Не удалось загрузить preview")
 
     def _fit_frame(self, frame: Image.Image) -> Image.Image:
-        canvas = Image.new("RGB", (self.display_width, self.display_height), "#101826")
-        prepared = frame.copy()
-        prepared.thumbnail((self.display_width, self.display_height), Image.Resampling.LANCZOS)
-        offset_x = max(0, (self.display_width - prepared.width) // 2)
-        offset_y = max(0, (self.display_height - prepared.height) // 2)
-        canvas.paste(prepared, (offset_x, offset_y))
-        return canvas
+        # cover: заполняем всю область, обрезая лишнее по краям (без чёрных полос)
+        frame_ratio = frame.width / frame.height
+        display_ratio = self.display_width / self.display_height
+        if frame_ratio > display_ratio:
+            new_h = self.display_height
+            new_w = int(frame_ratio * new_h)
+        else:
+            new_w = self.display_width
+            new_h = int(new_w / frame_ratio)
+        resized = frame.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        left = (new_w - self.display_width) // 2
+        top  = (new_h - self.display_height) // 2
+        return resized.crop((left, top, left + self.display_width, top + self.display_height))
 
     def _set_frames(self, pil_frames: list[Image.Image], delay_ms: int) -> None:
         self.frames = [
@@ -619,6 +664,13 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         widget = self.focus_get()
         if widget is None:
             return
+        # Разворачиваем обёртки CustomTkinter до внутреннего tk-виджета,
+        # иначе isinstance(widget, tk.Entry/Text) возвращает False
+        for _attr in ("_entry", "_textbox"):
+            _inner = getattr(widget, _attr, None)
+            if _inner is not None:
+                widget = _inner
+                break
         try:
             widget_state = str(widget.cget("state"))
         except Exception:

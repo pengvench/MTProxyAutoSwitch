@@ -3,7 +3,19 @@ setlocal
 
 cd /d "%~dp0"
 
-python -m pip install --upgrade pyinstaller customtkinter darkdetect pystray qrcode TelethonFakeTLS cryptography pillow imageio imageio-ffmpeg pywin32
+python -m pip install --upgrade ^
+    pyinstaller ^
+    customtkinter ^
+    darkdetect ^
+    pystray ^
+    qrcode ^
+    TelethonFakeTLS ^
+    cryptography ^
+    pillow ^
+    imageio ^
+    imageio-ffmpeg ^
+    pywin32
+
 python -m pip install telethon==1.42.0
 
 if exist build rmdir /s /q build
