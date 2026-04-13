@@ -1786,11 +1786,10 @@ class SettingsDialog(ctk.CTkToplevel):
 
         self._create_variables()
         self._build_layout()
-        self.refresh_from_runtime()
+        self._bind_dialog_clipboard()
+        self.after(0, self.refresh_from_runtime)   # defer — окно появляется раньше
         self.after(50, self._refresh_general_layout)
-        # FIX: убран after(20, self._show_ready) — он вызывал двойной deiconify/lift,
-        # из-за чего окно мигало и открывалось "несколько раз".
-        # CTkToplevel сам управляет видимостью при создании.
+        self.after(80, self._show_window_ready)    # показать окно после инициализации
 
     # FIX: дебаунс resize — обновляем layout не чаще чем раз в 80ms
     def _on_resize(self, event=None) -> None:
@@ -1799,6 +1798,60 @@ class SettingsDialog(ctk.CTkToplevel):
                 with contextlib.suppress(Exception):
                     self.after_cancel(self._resize_job)
             self._resize_job = self.after(80, self._do_deferred_resize)
+
+    def _show_window_ready(self) -> None:
+        """Показать окно после полной инициализации — устраняет мигание."""
+        with contextlib.suppress(Exception):
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+
+    def _bind_dialog_clipboard(self) -> None:
+        """Диалог-уровневый перехват Ctrl+кириллица.
+        tk.Entry не имеет класс-биндинга для <Control-м>, поэтому
+        событие всплывает от Entry до Toplevel — перехватываем здесь.
+        """
+        def _route(action: str) -> str:
+            focused = self.focus_get()
+            if focused is None:
+                return "break"
+            try:
+                if action == "paste":
+                    text = self.clipboard_get()
+                    with contextlib.suppress(Exception):
+                        focused.delete("sel.first", "sel.last")
+                    focused.insert("insert", text)
+                elif action == "copy":
+                    text = focused.selection_get()
+                    self.clipboard_clear()
+                    self.clipboard_append(text)
+                elif action == "cut":
+                    text = focused.selection_get()
+                    self.clipboard_clear()
+                    self.clipboard_append(text)
+                    focused.delete("sel.first", "sel.last")
+                elif action == "select_all":
+                    if isinstance(focused, tk.Text):
+                        focused.tag_add("sel", "1.0", "end-1c")
+                    else:
+                        with contextlib.suppress(Exception):
+                            focused.select_range(0, "end")
+                            focused.icursor("end")
+            except Exception:
+                pass
+            return "break"
+
+        for seq, act in [
+            ("<Control-м>", "paste"),   ("<Control-М>", "paste"),
+            ("<Control-с>", "copy"),    ("<Control-С>", "copy"),
+            ("<Control-ч>", "cut"),     ("<Control-Ч>", "cut"),
+            ("<Control-ф>", "select_all"), ("<Control-Ф>", "select_all"),
+            ("<Control-v>", "paste"),   ("<Control-V>", "paste"),
+            ("<Control-c>", "copy"),    ("<Control-C>", "copy"),
+            ("<Control-x>", "cut"),     ("<Control-X>", "cut"),
+            ("<Control-a>", "select_all"), ("<Control-A>", "select_all"),
+        ]:
+            self.bind(seq, lambda e, a=act: _route(a), add="+")
 
     def _do_deferred_resize(self) -> None:
         self._resize_job = None
