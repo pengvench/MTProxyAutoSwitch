@@ -10,12 +10,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from mtproxy_net import create_verified_ssl_context
+
 APP_PUBLIC_VERSION = "1.2"
 GITHUB_REPO = "pengvench/MTProxyAutoSwitch"
 LATEST_RELEASE_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 LATEST_RELEASE_PAGE_URL = f"https://github.com/{GITHUB_REPO}/releases/latest"
 PUBLIC_WINDOWS_ASSET = "MTProxyAutoSwitchPublic.zip"
 USER_AGENT = "MTProxyAutoSwitchUpdater/1.2"
+URLLIB_SSL_CONTEXT = create_verified_ssl_context()
 
 
 @dataclass(frozen=True)
@@ -111,7 +114,7 @@ def launch_windows_update(script_path: str) -> None:
 def _download_file(url: str, path: Path) -> None:
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     path.parent.mkdir(parents=True, exist_ok=True)
-    with urllib.request.urlopen(request, timeout=30.0) as response, path.open("wb") as handle:
+    with urllib.request.urlopen(request, timeout=30.0, context=URLLIB_SSL_CONTEXT) as response, path.open("wb") as handle:
         shutil.copyfileobj(response, handle)
 
 
@@ -167,7 +170,7 @@ def _fetch_latest_release_via_api(timeout: float) -> ReleaseInfo:
             "User-Agent": USER_AGENT,
         },
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urllib.request.urlopen(request, timeout=timeout, context=URLLIB_SSL_CONTEXT) as response:
         payload = json.loads(response.read().decode("utf-8"))
 
     assets = payload.get("assets", []) or []
@@ -207,7 +210,7 @@ def _fetch_latest_release_via_page(timeout: float) -> ReleaseInfo:
         LATEST_RELEASE_PAGE_URL,
         headers={"User-Agent": USER_AGENT},
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urllib.request.urlopen(request, timeout=timeout, context=URLLIB_SSL_CONTEXT) as response:
         final_url = str(response.geturl() or LATEST_RELEASE_PAGE_URL)
         html = response.read().decode("utf-8", errors="ignore")
 

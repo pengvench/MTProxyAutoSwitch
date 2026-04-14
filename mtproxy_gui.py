@@ -5,6 +5,7 @@ import ctypes
 import datetime
 import io
 import os
+import plistlib
 import queue
 import secrets
 import subprocess
@@ -79,6 +80,11 @@ CLOSE_LABELS = {
     "tray": "Скрывать в трей",
     "exit": "Закрывать приложение",
 }
+AUTOSTART_SUPPORTED = sys.platform in {"win32", "darwin"}
+AUTOSTART_LABEL = {
+    "win32": "Запускать вместе с Windows",
+    "darwin": "Запускать вместе с macOS",
+}.get(sys.platform, "Запускать вместе с системой")
 
 ctk.set_appearance_mode("system")
 ctk.set_default_color_theme("blue")
@@ -173,7 +179,13 @@ ADVANCED_PROBE_TIPS = {
 }
 
 GENERAL_SETTING_TIPS = {
-    "autostart": "Приложение будет запускаться вместе с Windows.",
+    "autostart": (
+        "Приложение будет запускаться вместе с macOS."
+        if sys.platform == "darwin"
+        else "Приложение будет запускаться вместе с Windows."
+        if sys.platform == "win32"
+        else "Автозапуск на этой платформе не поддерживается."
+    ),
     "start_minimized": "При запуске окно не будет открываться поверх рабочего стола, приложение сразу уйдет в трей.",
     "auto_start_local": "Если уже есть рабочий пул, локальный proxy frontend стартует автоматически.",
     "auto_update": "Только для public build. Приложение будет проверять GitHub Releases при запуске.",
@@ -836,12 +848,26 @@ def _strip_hosts_block(text: str) -> str:
 def _autostart_command() -> str:
     target = Path(sys.executable).resolve()
     if getattr(sys, "frozen", False):
+        if sys.platform == "darwin":
+            app_bundle = _macos_app_bundle_path(target)
+            if app_bundle is not None:
+                return f'/usr/bin/open -a "{app_bundle}"'
         return f'"{target}"'
     script = Path(__file__).resolve()
     return f'"{target}" "{script}"'
 
 
 def is_autostart_enabled() -> bool:
+    if sys.platform == "darwin":
+        plist_path = _macos_launch_agent_path()
+        if not plist_path.exists():
+            return False
+        try:
+            with plist_path.open("rb") as handle:
+                payload = plistlib.load(handle)
+        except Exception:
+            return False
+        return list(payload.get("ProgramArguments") or []) == _macos_launch_agent_payload().get("ProgramArguments")
     if winreg is None:
         return False
     try:
@@ -855,8 +881,20 @@ def is_autostart_enabled() -> bool:
 
 
 def set_autostart_enabled(enabled: bool) -> None:
+    if sys.platform == "darwin":
+        plist_path = _macos_launch_agent_path()
+        if enabled:
+            plist_path.parent.mkdir(parents=True, exist_ok=True)
+            with plist_path.open("wb") as handle:
+                plistlib.dump(_macos_launch_agent_payload(), handle, sort_keys=False)
+        else:
+            with contextlib.suppress(FileNotFoundError):
+                plist_path.unlink()
+        return
     if winreg is None:
-        raise RuntimeError("autostart_is_not_supported_on_this_platform")
+        if enabled:
+            raise RuntimeError("autostart_is_not_supported_on_this_platform")
+        return
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, AUTOSTART_KEY) as key:
         if enabled:
             winreg.SetValueEx(key, AUTOSTART_VALUE, 0, winreg.REG_SZ, _autostart_command())
@@ -865,6 +903,47 @@ def set_autostart_enabled(enabled: bool) -> None:
                 winreg.DeleteValue(key, AUTOSTART_VALUE)
             except FileNotFoundError:
                 pass
+
+
+def _macos_app_bundle_path(target: Path | None = None) -> Path | None:
+    executable_path = (target or Path(sys.executable)).resolve()
+    macos_dir = executable_path.parent
+    if macos_dir.name != "MacOS":
+        return None
+    contents_dir = macos_dir.parent
+    if contents_dir.name != "Contents":
+        return None
+    app_bundle = contents_dir.parent
+    if app_bundle.suffix != ".app":
+        return None
+    return app_bundle
+
+
+def _macos_launch_agent_path() -> Path:
+    bundle_id = "com.mtproxyautoswitch.public" if is_public_release() else "com.mtproxyautoswitch"
+    return Path.home() / "Library" / "LaunchAgents" / f"{bundle_id}.plist"
+
+
+def _macos_launch_agent_payload() -> dict[str, object]:
+    target = Path(sys.executable).resolve()
+    app_bundle = _macos_app_bundle_path(target)
+    if app_bundle is not None:
+        arguments = ["/usr/bin/open", "-a", str(app_bundle)]
+        working_directory = str(app_bundle.parent)
+    elif getattr(sys, "frozen", False):
+        arguments = [str(target)]
+        working_directory = str(target.parent)
+    else:
+        script = Path(__file__).resolve()
+        arguments = [str(target), str(script)]
+        working_directory = str(script.parent)
+    return {
+        "Label": _macos_launch_agent_path().stem,
+        "ProgramArguments": arguments,
+        "WorkingDirectory": working_directory,
+        "RunAtLoad": True,
+        "KeepAlive": False,
+    }
 
 
 class MTProxyAutoSwitchApp(ctk.CTk):
@@ -1595,6 +1674,13 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             return
         if bool(self.update_info.get("checking")) or self.refresh_in_progress or self.runtime_call_count > 0:
             return
+        if sys.platform != "win32":
+            release_url = str(self.update_info.get("html_url") or "") or "https://github.com/pengvench/MTProxyAutoSwitch/releases/latest"
+            if webbrowser.open(release_url):
+                self._set_update_status("Открыта страница релиза")
+            else:
+                self._set_update_status("Откройте страницу релиза вручную")
+            return
         self.update_info["checking"] = True
         self._set_update_status("Подготовка обновления...")
 
@@ -1784,7 +1870,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             except Exception as exc:
                 ui_call(self._runtime_call_finished)
                 if on_error is None:
-                    ui_call(lambda: messagebox.showerror("Ошибка", str(exc)))
+                    ui_call(lambda exc=exc: messagebox.showerror("Ошибка", str(exc)))
                     return
                 ui_call(lambda exc=exc: on_error(exc))
                 return
@@ -2352,7 +2438,10 @@ class SettingsDialog(ctk.CTkToplevel):
         ctk.CTkLabel(left, text="Поведение приложения", font=("Segoe UI Semibold", 16), text_color=COLOR_TEXT).pack(anchor="w", padx=18, pady=(16, 10))
         row = ctk.CTkFrame(left, fg_color="transparent")
         row.pack(anchor="w", padx=18, pady=6)
-        ctk.CTkCheckBox(row, text="Запускать вместе с Windows", variable=self.autostart_var).pack(side="left")
+        autostart_checkbox = ctk.CTkCheckBox(row, text=AUTOSTART_LABEL, variable=self.autostart_var)
+        autostart_checkbox.pack(side="left")
+        if not AUTOSTART_SUPPORTED:
+            autostart_checkbox.configure(state="disabled")
         _add_help_badge(row, GENERAL_SETTING_TIPS["autostart"])
         row = ctk.CTkFrame(left, fg_color="transparent")
         row.pack(anchor="w", padx=18, pady=6)
@@ -3217,7 +3306,7 @@ class SettingsDialog(ctk.CTkToplevel):
                     raise
                 return _invalid(field, value)
 
-        payload["autostart_enabled"] = bool(self.autostart_var.get())
+        payload["autostart_enabled"] = bool(self.autostart_var.get()) if AUTOSTART_SUPPORTED else False
         payload["start_minimized_to_tray"] = bool(self.start_minimized_var.get())
         payload["auto_start_local"] = bool(self.auto_start_local_var.get())
         payload["appearance"] = next((code for code, label in APPEARANCE_LABELS.items() if label == self.appearance_var.get()), "auto")

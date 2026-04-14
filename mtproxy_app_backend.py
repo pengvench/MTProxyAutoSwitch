@@ -46,8 +46,37 @@ from mtproxy_telegram import (
 
 def runtime_root() -> Path:
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
+        executable_path = Path(sys.executable).resolve()
+        if sys.platform == "darwin":
+            app_bundle = _macos_app_bundle_path(executable_path)
+            if app_bundle is not None:
+                bundle_parent = app_bundle.parent
+                if any((bundle_parent / name).exists() for name in ("config.json", ".env", "list")):
+                    return bundle_parent
+                if os.access(bundle_parent, os.W_OK):
+                    return bundle_parent
+                support_dir = Path.home() / "Library" / "Application Support" / _runtime_app_dir_name()
+                support_dir.mkdir(parents=True, exist_ok=True)
+                return support_dir
+        return executable_path.parent
     return Path(__file__).resolve().parent
+
+
+def _macos_app_bundle_path(executable_path: Path) -> Path | None:
+    macos_dir = executable_path.parent
+    if macos_dir.name != "MacOS":
+        return None
+    contents_dir = macos_dir.parent
+    if contents_dir.name != "Contents":
+        return None
+    app_bundle = contents_dir.parent
+    if app_bundle.suffix != ".app":
+        return None
+    return app_bundle
+
+
+def _runtime_app_dir_name() -> str:
+    return "MTProxyAutoSwitchPublic" if os.environ.get("MTPROXY_PUBLIC_RELEASE", "").strip().lower() in {"1", "true", "yes", "on"} else "MTProxyAutoSwitch"
 
 
 @dataclass

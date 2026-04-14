@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
+import platform
 import tempfile
 import pathlib
 
@@ -9,6 +10,21 @@ from PyInstaller.utils.hooks import collect_all
 
 imageio_datas, imageio_binaries, imageio_hiddenimports = collect_all('imageio')
 imageio_ffmpeg_datas, imageio_ffmpeg_binaries, imageio_ffmpeg_hidden = collect_all('imageio_ffmpeg')
+
+
+def _resolve_target_arch() -> str | None:
+    forced_arch = os.environ.get('MTPROXY_TARGET_ARCH', '').strip().lower()
+    if forced_arch in {'x86_64', 'arm64', 'universal2'}:
+        return forced_arch
+    machine = platform.machine().strip().lower()
+    if machine in {'arm64', 'aarch64'}:
+        return 'arm64'
+    if machine in {'x86_64', 'amd64'}:
+        return 'x86_64'
+    return None
+
+
+target_arch = _resolve_target_arch()
 
 _hook_code = (
     "import os, sys, pathlib\n"
@@ -81,7 +97,7 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
-    target_arch='universal2',
+    target_arch=target_arch,
     codesign_identity=None,
     entitlements_file=None,
     icon=[],

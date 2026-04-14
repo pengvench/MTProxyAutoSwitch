@@ -31,6 +31,7 @@ pystray
 qrcode
 TelethonFakeTLS
 telethon
+certifi
 cryptography
 pillow
 imageio
@@ -52,7 +53,22 @@ The script also copies:
 
 - `README.txt`
 - `config.json`
+- `mtproxy_seed.json`
 - `list/proxy_list.txt`
+
+On macOS the build now targets the current CPU architecture by default:
+
+- Apple Silicon -> `arm64`
+- Intel Mac -> `x86_64`
+
+If you really need a different target, override it explicitly:
+
+```bash
+MTPROXY_TARGET_ARCH=universal2 ./build_release_public_macos.sh
+```
+
+When the app runs from a `.app` bundle, it first looks for `config.json`, `.env` and `list/` next to the bundle in `release-macos/MTProxyAutoSwitchPublic/`.
+If that folder is not writable, it falls back to `~/Library/Application Support/MTProxyAutoSwitchPublic/`.
 
 ## Gatekeeper
 

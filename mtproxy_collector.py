@@ -6,6 +6,7 @@ import contextlib
 import html
 import json
 import logging
+import os
 import re
 import statistics
 import sys
@@ -23,6 +24,8 @@ from telethon import TelegramClient, functions
 from telethon.network.connection.tcpmtproxy import ConnectionTcpMTProxyRandomizedIntermediate
 from telethon.sessions import MemorySession
 from TelethonFakeTLS import ConnectionTcpMTProxyFakeTLS
+
+from mtproxy_net import create_insecure_ssl_context, create_verified_ssl_context, is_tls_verification_error
 
 
 DEFAULT_SOURCES = [
@@ -237,6 +240,9 @@ class CollectorRunResult:
 class Fetcher:
     def __init__(self, timeout: float) -> None:
         self.timeout = timeout
+        self.ssl_context = create_verified_ssl_context()
+        self.insecure_ssl_context = create_insecure_ssl_context()
+        self.allow_insecure_tls = os.environ.get("MTPROXY_ALLOW_INSECURE_TLS", "1").strip().lower() not in {"0", "false", "no", "off"}
 
     def fetch_text(self, url: str, referer: str | None = None) -> str:
         headers = dict(BROWSER_HEADERS)
@@ -245,18 +251,28 @@ class Fetcher:
         request = Request(url, headers=headers)
 
         try:
-            with urlopen(request, timeout=self.timeout) as response:
-                payload = response.read()
-                charset = response.headers.get_content_charset() or "utf-8"
-                return payload.decode(charset, errors="replace")
-        except TimeoutError as exc:
-            raise RuntimeError(f"{url} -> timed out") from exc
-        except HTTPError as exc:
-            raise RuntimeError(f"{url} -> HTTP {exc.code}") from exc
-        except URLError as exc:
-            raise RuntimeError(f"{url} -> {exc.reason}") from exc
-        except OSError as exc:
+            return self._fetch_text(request, self.ssl_context)
+        except Exception as exc:
+            if self.allow_insecure_tls and is_tls_verification_error(exc):
+                try:
+                    return self._fetch_text(request, self.insecure_ssl_context)
+                except Exception as retry_exc:
+                    exc = retry_exc
+            if isinstance(exc, TimeoutError):
+                raise RuntimeError(f"{url} -> timed out") from exc
+            if isinstance(exc, HTTPError):
+                raise RuntimeError(f"{url} -> HTTP {exc.code}") from exc
+            if isinstance(exc, URLError):
+                raise RuntimeError(f"{url} -> {exc.reason}") from exc
+            if isinstance(exc, OSError):
+                raise RuntimeError(f"{url} -> {exc}") from exc
             raise RuntimeError(f"{url} -> {exc}") from exc
+
+    def _fetch_text(self, request: Request, context) -> str:
+        with urlopen(request, timeout=self.timeout, context=context) as response:
+            payload = response.read()
+            charset = response.headers.get_content_charset() or "utf-8"
+            return payload.decode(charset, errors="replace")
 
 
 def emit_event(event_sink: EventSink | None, event_name: str, **payload: Any) -> None:
