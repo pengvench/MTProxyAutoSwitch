@@ -212,28 +212,52 @@ class AppRuntime:
         payload = asdict(self.config)
         self.config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def apply_config(self, config: AppConfig) -> None:
-        config.local_fake_tls_enabled = False
-        config.local_fake_tls_domain = ""
-        if int(config.telegram_source_max_age_days or 0) <= 0:
-            config.telegram_source_max_age_days = DEFAULT_SOURCE_MAX_AGE_DAYS
-        self.config = config
+    @staticmethod
+    def _normalize_config(config: AppConfig) -> AppConfig:
+        normalized = AppConfig(**asdict(config))
+        normalized.local_fake_tls_enabled = False
+        normalized.local_fake_tls_domain = ""
+        if int(normalized.telegram_source_max_age_days or 0) <= 0:
+            normalized.telegram_source_max_age_days = DEFAULT_SOURCE_MAX_AGE_DAYS
+        return normalized
+
+    @staticmethod
+    def _local_server_signature(config: AppConfig) -> tuple[object, ...]:
+        return (
+            config.local_host,
+            int(config.local_port),
+            config.local_secret,
+            bool(config.local_fake_tls_enabled),
+            config.local_fake_tls_domain,
+        )
+
+    def apply_config(self, config: AppConfig) -> bool:
+        normalized = self._normalize_config(config)
+        current = self._normalize_config(self.config)
+        if normalized == current:
+            self.config = normalized
+            return False
+
+        restart_local_server = self._local_server_signature(normalized) != self._local_server_signature(current)
+        self.config = normalized
         self.save_config()
         was_running = self.local_server.is_running()
-        if was_running:
-            self.stop_local_server()
-        self.local_server = LocalMTProxyServer(
-            self.pool,
-            host=self.config.local_host,
-            port=self.config.local_port,
-            secret=self.config.local_secret,
-            fake_tls_enabled=False,
-            fake_tls_domain="",
-            log_sink=self._log,
-            event_sink=self._emit,
-        )
-        if was_running and self.config.auto_start_local and self.pool.count() > 0:
-            self.start_local_server()
+        if restart_local_server:
+            if was_running:
+                self.stop_local_server()
+            self.local_server = LocalMTProxyServer(
+                self.pool,
+                host=self.config.local_host,
+                port=self.config.local_port,
+                secret=self.config.local_secret,
+                fake_tls_enabled=False,
+                fake_tls_domain="",
+                log_sink=self._log,
+                event_sink=self._emit,
+            )
+            if was_running and self.config.auto_start_local and self.pool.count() > 0:
+                self.start_local_server()
+        return True
 
     def start_local_server(self) -> None:
         if self.pool.count() <= 0:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import datetime
 import io
 import os
@@ -9,12 +10,13 @@ import secrets
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import webbrowser
 import tkinter as tk
 from dataclasses import asdict
 from pathlib import Path
-from tkinter import messagebox, ttk
+from tkinter import ttk
 
 import customtkinter as ctk
 import pystray
@@ -233,21 +235,262 @@ def _appearance_label(mode: str) -> str:
     return APPEARANCE_LABELS.get(mode, APPEARANCE_LABELS["auto"])
 
 
-def _center_window(window: tk.Misc, width: int, height: int) -> None:
+def _primary_monitor_workarea(window: tk.Misc | None = None) -> tuple[int, int, int, int]:
+    if sys.platform == "win32":
+        try:
+            class RECT(ctypes.Structure):
+                _fields_ = [
+                    ("left", ctypes.c_long),
+                    ("top", ctypes.c_long),
+                    ("right", ctypes.c_long),
+                    ("bottom", ctypes.c_long),
+                ]
+
+            rect = RECT()
+            if ctypes.windll.user32.SystemParametersInfoW(48, 0, ctypes.byref(rect), 0):
+                return rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top
+        except Exception:
+            pass
+    if window is None:
+        return 0, 0, 1280, 720
+    return 0, 0, int(window.winfo_screenwidth()), int(window.winfo_screenheight())
+
+
+def _center_window(window: tk.Misc, width: int, height: int, *, primary_monitor: bool = False) -> None:
     window.update_idletasks()
-    screen_width = window.winfo_screenwidth()
-    screen_height = window.winfo_screenheight()
-    left = max(0, (screen_width - width) // 2)
-    top = max(0, (screen_height - height) // 2)
+    if primary_monitor:
+        origin_left, origin_top, screen_width, screen_height = _primary_monitor_workarea(window)
+    else:
+        origin_left, origin_top = 0, 0
+        screen_width = int(window.winfo_screenwidth())
+        screen_height = int(window.winfo_screenheight())
+    left = origin_left + max(0, (screen_width - width) // 2)
+    top = origin_top + max(0, (screen_height - height) // 2)
     window.geometry(f"{width}x{height}+{left}+{top}")
 
 
-def _set_fixed_window_size(window: tk.Misc, width: int, height: int) -> None:
-    _center_window(window, width, height)
+def _set_fixed_window_size(window: tk.Misc, width: int, height: int, *, primary_monitor: bool = False) -> None:
+    _center_window(window, width, height, primary_monitor=primary_monitor)
     with contextlib.suppress(Exception):
         window.minsize(width, height)
         window.maxsize(width, height)
         window.resizable(False, False)
+
+
+class _PrimaryMonitorModal(ctk.CTkToplevel):
+    def __init__(
+        self,
+        parent: tk.Misc | None,
+        *,
+        title: str,
+        message: str,
+        kind: str,
+        buttons: tuple[str, ...],
+    ) -> None:
+        owner = parent if isinstance(parent, tk.Misc) else tk._default_root
+        super().__init__(owner)
+        self.result: str | None = None
+        self._buttons = buttons
+        self.withdraw()
+        self.title(title)
+        with contextlib.suppress(Exception):
+            if APP_ICON_PATH.exists():
+                self.iconbitmap(str(APP_ICON_PATH))
+        _set_fixed_window_size(self, 460, 240 if len(buttons) == 1 else 250, primary_monitor=True)
+        self.transient(owner)
+        self.grab_set()
+        self.configure(fg_color=COLOR_BG)
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.bind("<Escape>", lambda _event: self._cancel(), add="+")
+
+        accent_map = {
+            "info": (COLOR_ACCENT_SOFT, COLOR_ACCENT),
+            "warning": (COLOR_WARN_BG, COLOR_WARN_TEXT),
+            "error": (COLOR_DANGER_BG, COLOR_DANGER_TEXT),
+            "question": (COLOR_ACCENT_SOFT, COLOR_ACCENT),
+        }
+        badge_bg, badge_text = accent_map.get(kind, (COLOR_ACCENT_SOFT, COLOR_ACCENT))
+
+        card = ctk.CTkFrame(self, corner_radius=24, fg_color=COLOR_CARD, border_width=1, border_color=COLOR_BORDER)
+        card.pack(fill="both", expand=True, padx=18, pady=18)
+
+        header = ctk.CTkFrame(card, fg_color="transparent")
+        header.pack(fill="x", padx=18, pady=(18, 10))
+        ctk.CTkLabel(
+            header,
+            text={"info": "i", "warning": "!", "error": "x", "question": "?"}.get(kind, "i"),
+            width=34,
+            height=34,
+            corner_radius=17,
+            fg_color=badge_bg,
+            text_color=badge_text,
+            font=("Segoe UI Semibold", 18),
+        ).pack(side="left")
+        ctk.CTkLabel(
+            header,
+            text=title,
+            text_color=COLOR_TEXT,
+            font=("Segoe UI Semibold", 18),
+        ).pack(side="left", padx=(12, 0))
+
+        ctk.CTkLabel(
+            card,
+            text=message,
+            text_color=COLOR_TEXT,
+            font=("Segoe UI", 12),
+            justify="left",
+            wraplength=388,
+        ).pack(fill="x", padx=18, pady=(0, 18))
+
+        actions = ctk.CTkFrame(card, fg_color="transparent")
+        actions.pack(fill="x", padx=18, pady=(0, 18))
+        for index in range(len(buttons)):
+            actions.grid_columnconfigure(index, weight=1, uniform="alert_actions")
+        for index, button_name in enumerate(buttons):
+            label = {
+                "ok": "OK",
+                "yes": "Да",
+                "no": "Нет",
+            }.get(button_name, button_name)
+            is_primary = button_name in {"ok", "yes"}
+            ctk.CTkButton(
+                actions,
+                text=label,
+                height=40,
+                corner_radius=20,
+                fg_color=COLOR_ACCENT if is_primary else COLOR_ACCENT_SOFT,
+                hover_color=COLOR_ACCENT_HOVER if is_primary else COLOR_ACCENT_SOFT_HOVER,
+                text_color="#FFFFFF" if is_primary else COLOR_ACCENT,
+                command=lambda value=button_name: self._choose(value),
+            ).grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 6, 0 if index == len(buttons) - 1 else 6))
+
+        self.after(0, self._show_ready)
+
+    def _show_ready(self) -> None:
+        with contextlib.suppress(Exception):
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+
+    def _choose(self, value: str) -> None:
+        self.result = value
+        self.destroy()
+
+    def _cancel(self) -> None:
+        self.result = "no" if "no" in self._buttons else "ok"
+        self.destroy()
+
+    def show(self) -> str | None:
+        self.wait_window()
+        return self.result
+
+
+class _PrimaryMonitorMessageBox:
+    def __init__(self) -> None:
+        self._active_keys: dict[str, _PrimaryMonitorModal] = {}
+        self._last_shown_at: dict[str, float] = {}
+        self._cooldown_sec = 1.25
+
+    def _resolve_parent(self, parent: tk.Misc | None) -> tk.Misc | None:
+        if isinstance(parent, tk.Misc):
+            return parent
+        return tk._default_root
+
+    def _show_modal(
+        self,
+        kind: str,
+        title: str,
+        message: str,
+        *,
+        parent: tk.Misc | None = None,
+        dedupe_key: str | None = None,
+    ) -> str | None:
+        owner = self._resolve_parent(parent)
+        if dedupe_key:
+            active = self._active_keys.get(dedupe_key)
+            if active is not None:
+                with contextlib.suppress(Exception):
+                    if active.winfo_exists():
+                        active.lift()
+                        active.focus_force()
+                        return "ok"
+            last_shown_at = self._last_shown_at.get(dedupe_key, 0.0)
+            if time.monotonic() - last_shown_at < self._cooldown_sec:
+                return "ok"
+
+        buttons = ("yes", "no") if kind == "question" else ("ok",)
+        dialog = _PrimaryMonitorModal(
+            owner,
+            title=title,
+            message=message,
+            kind=kind,
+            buttons=buttons,
+        )
+        if dedupe_key:
+            self._active_keys[dedupe_key] = dialog
+        try:
+            return dialog.show()
+        finally:
+            if dedupe_key:
+                self._last_shown_at[dedupe_key] = time.monotonic()
+                active = self._active_keys.get(dedupe_key)
+                if active is dialog:
+                    self._active_keys.pop(dedupe_key, None)
+
+    def showinfo(self, title: str, message: str, *, parent: tk.Misc | None = None, dedupe_key: str | None = None) -> str:
+        self._show_modal("info", title, message, parent=parent, dedupe_key=dedupe_key)
+        return "ok"
+
+    def showwarning(self, title: str, message: str, *, parent: tk.Misc | None = None, dedupe_key: str | None = None) -> str:
+        self._show_modal("warning", title, message, parent=parent, dedupe_key=dedupe_key)
+        return "ok"
+
+    def showerror(self, title: str, message: str, *, parent: tk.Misc | None = None, dedupe_key: str | None = None) -> str:
+        self._show_modal("error", title, message, parent=parent, dedupe_key=dedupe_key)
+        return "ok"
+
+    def askyesno(self, title: str, message: str, *, parent: tk.Misc | None = None) -> bool:
+        return self._show_modal("question", title, message, parent=parent) == "yes"
+
+
+messagebox = _PrimaryMonitorMessageBox()
+
+
+_CLIPBOARD_CTRL_KEYSYMS = {
+    "a": "select_all",
+    "c": "copy",
+    "v": "paste",
+    "x": "cut",
+    "ф": "select_all",
+    "с": "copy",
+    "м": "paste",
+    "ч": "cut",
+}
+_CLIPBOARD_CTRL_KEYCODES = {
+    65: "select_all",
+    67: "copy",
+    86: "paste",
+    88: "cut",
+}
+
+
+def _resolve_clipboard_shortcut(event: tk.Event) -> str | None:
+    state = int(getattr(event, "state", 0))
+    keysym = str(getattr(event, "keysym", "") or "").lower()
+    keycode = int(getattr(event, "keycode", -1))
+    is_ctrl = bool(state & 0x4)
+    is_shift = bool(state & 0x1)
+
+    if is_ctrl:
+        if keysym == "insert" or keycode == 45:
+            return "copy"
+        return _CLIPBOARD_CTRL_KEYSYMS.get(keysym) or _CLIPBOARD_CTRL_KEYCODES.get(keycode)
+    if is_shift:
+        if keysym == "insert" or keycode == 45:
+            return "paste"
+        if keysym == "delete" or keycode == 46:
+            return "cut"
+    return None
 
 
 def _bind_clipboard_shortcuts(widget: object, *, readonly: bool = False) -> None:
@@ -382,6 +625,18 @@ def _bind_clipboard_shortcuts(widget: object, *, readonly: bool = False) -> None
                 menu.grab_release()
         return "break"
 
+    def _handle_keypress(event=None):
+        action = _resolve_clipboard_shortcut(event)
+        if action == "copy":
+            return _copy(event)
+        if action == "cut":
+            return _cut(event)
+        if action == "paste":
+            return _paste(event)
+        if action == "select_all":
+            return _select_all(event)
+        return None
+
     sequences = (
         ("<Control-a>", _select_all),
         ("<Control-A>", _select_all),
@@ -412,10 +667,21 @@ def _bind_clipboard_shortcuts(widget: object, *, readonly: bool = False) -> None
         ("<<Paste>>", _paste),
         ("<Button-3>", _show_context_menu),
     )
+    sequences = (
+        ("<KeyPress>", _handle_keypress),
+        ("<<Copy>>", _copy),
+        ("<<Cut>>", _cut),
+        ("<<Paste>>", _paste),
+        ("<Button-3>", _show_context_menu),
+    )
     for bind_target in bind_targets:
+        if getattr(bind_target, "_clipboard_shortcuts_bound", False):
+            continue
         for sequence, callback in sequences:
             with contextlib.suppress(Exception):
                 bind_target.bind(sequence, callback, add="+")
+        with contextlib.suppress(Exception):
+            setattr(bind_target, "_clipboard_shortcuts_bound", True)
 
 
 def _add_help_badge(parent: ctk.CTkFrame, text: str) -> ctk.CTkLabel:
@@ -537,6 +803,8 @@ class LoopingVideoPreview(ctk.CTkFrame):
             with contextlib.suppress(Exception):
                 self.after_cancel(self._frame_job)
             self._frame_job = None
+        with contextlib.suppress(Exception):
+            self.video_label.configure(image=None)
         # Явно освобождаем PIL/tk PhotoImage объекты
         self.frames.clear()
         super().destroy()
@@ -1202,7 +1470,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         self.open_output_button.configure(state="disabled" if ui_busy else "normal")
         self.copy_button.configure(state="normal" if local_url else "disabled")
         if self.settings_button is not None:
-            self.settings_button.configure(state="disabled" if ui_busy else "normal")
+            self.settings_button.configure(state="disabled" if self.refresh_in_progress else "normal")
 
         if local_url:
             self.link_preview_var.set(_trim_middle(local_url, 72))
@@ -1451,7 +1719,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
                 webbrowser.open(web_url)
 
     def open_settings(self) -> None:
-        if self.refresh_in_progress or self.runtime_call_count > 0 or bool(self.update_info.get("checking")):
+        if self.refresh_in_progress:
             return
         if self.settings_dialog is not None:
             try:
@@ -1469,9 +1737,12 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         # CTkToplevel сам показывается — дополнительный вызов создавал мигание.
         self.settings_dialog = SettingsDialog(self)
 
-    def apply_config(self, config: AppConfig) -> None:
+    def apply_config(self, config: AppConfig) -> bool:
         previous_appearance = self.runtime.config.appearance
-        self.runtime.apply_config(config)
+        changed = self.runtime.apply_config(config)
+        if not changed:
+            self._refresh_snapshot()
+            return False
         set_autostart_enabled(config.autostart_enabled)
         self._apply_appearance()
         self._configure_ttk_style()
@@ -1482,6 +1753,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
                 self.settings_dialog = None
                 dialog.destroy()
         self._refresh_snapshot()
+        return True
 
     def run_runtime_call(
         self,
@@ -1770,9 +2042,16 @@ class MTProxyAutoSwitchApp(ctk.CTk):
 class SettingsDialog(ctk.CTkToplevel):
     def __init__(self, app: MTProxyAutoSwitchApp) -> None:
         super().__init__(app)
-        self.withdraw()  # скрыть до инициализации — убирает мигание
         self.app = app
         self._resize_job: str | None = None   # FIX: для дебаунса resize
+        self._dirty_job: str | None = None
+        self._dirty = False
+        self._refreshing_controls = False
+        self._baseline_payload: dict[str, object] | None = None
+        self._last_pool_signature: tuple[object, ...] | None = None
+        self._last_logs_signature: tuple[object, ...] | None = None
+        self._tab_poll_job: str | None = None
+        self._active_tab_name = ""
         self.title("Настройки")
         with contextlib.suppress(Exception):
             if APP_ICON_PATH.exists():
@@ -1786,10 +2065,11 @@ class SettingsDialog(ctk.CTkToplevel):
 
         self._create_variables()
         self._build_layout()
-        self._bind_dialog_clipboard()
-        self.after(0, self.refresh_from_runtime)   # defer — окно появляется раньше
+        self._setup_dirty_tracking()
+        self.after(0, self._show_window_ready)
+        self.after_idle(lambda: self.refresh_from_runtime(force_config=True))
         self.after(50, self._refresh_general_layout)
-        self.after(80, self._show_window_ready)    # показать окно после инициализации
+        self._schedule_tab_poll()
 
     # FIX: дебаунс resize — обновляем layout не чаще чем раз в 80ms
     def _on_resize(self, event=None) -> None:
@@ -1800,63 +2080,132 @@ class SettingsDialog(ctk.CTkToplevel):
             self._resize_job = self.after(80, self._do_deferred_resize)
 
     def _show_window_ready(self) -> None:
-        """Показать окно после полной инициализации — устраняет мигание."""
+        """Показать окно сразу, а тяжёлые данные догрузить после первого кадра."""
         with contextlib.suppress(Exception):
-            self.deiconify()
             self.lift()
             self.focus_force()
 
     def _bind_dialog_clipboard(self) -> None:
-        """Диалог-уровневый перехват Ctrl+кириллица.
-        tk.Entry не имеет класс-биндинга для <Control-м>, поэтому
-        событие всплывает от Entry до Toplevel — перехватываем здесь.
-        """
-        def _route(action: str) -> str:
-            focused = self.focus_get()
-            if focused is None:
-                return "break"
-            try:
-                if action == "paste":
-                    text = self.clipboard_get()
-                    with contextlib.suppress(Exception):
-                        focused.delete("sel.first", "sel.last")
-                    focused.insert("insert", text)
-                elif action == "copy":
-                    text = focused.selection_get()
-                    self.clipboard_clear()
-                    self.clipboard_append(text)
-                elif action == "cut":
-                    text = focused.selection_get()
-                    self.clipboard_clear()
-                    self.clipboard_append(text)
-                    focused.delete("sel.first", "sel.last")
-                elif action == "select_all":
-                    if isinstance(focused, tk.Text):
-                        focused.tag_add("sel", "1.0", "end-1c")
-                    else:
-                        with contextlib.suppress(Exception):
-                            focused.select_range(0, "end")
-                            focused.icursor("end")
-            except Exception:
-                pass
-            return "break"
-
-        for seq, act in [
-            ("<Control-м>", "paste"),   ("<Control-М>", "paste"),
-            ("<Control-с>", "copy"),    ("<Control-С>", "copy"),
-            ("<Control-ч>", "cut"),     ("<Control-Ч>", "cut"),
-            ("<Control-ф>", "select_all"), ("<Control-Ф>", "select_all"),
-            ("<Control-v>", "paste"),   ("<Control-V>", "paste"),
-            ("<Control-c>", "copy"),    ("<Control-C>", "copy"),
-            ("<Control-x>", "cut"),     ("<Control-X>", "cut"),
-            ("<Control-a>", "select_all"), ("<Control-A>", "select_all"),
-        ]:
-            self.bind(seq, lambda e, a=act: _route(a), add="+")
+        return
 
     def _do_deferred_resize(self) -> None:
         self._resize_job = None
         self._refresh_general_layout()
         self._refresh_wraplengths()
+
+    def _setup_dirty_tracking(self) -> None:
+        tracked_vars = [
+            self.autostart_var,
+            self.start_minimized_var,
+            self.auto_start_local_var,
+            self.appearance_var,
+            self.close_behavior_var,
+            self.telegram_sources_enabled_var,
+            self.deep_media_enabled_var,
+            self.rf_whitelist_check_var,
+            self.local_host_var,
+            self.local_port_var,
+            self.local_secret_var,
+            self.telegram_api_id_var,
+            self.telegram_api_hash_var,
+            self.duration_var,
+            self.interval_var,
+            self.timeout_var,
+            self.workers_var,
+            self.fetch_timeout_var,
+            self.max_latency_var,
+            self.min_success_var,
+            self.high_ratio_var,
+            self.high_streak_var,
+            self.max_proxies_var,
+            self.live_probe_interval_var,
+            self.live_probe_duration_var,
+            self.live_probe_top_n_var,
+            self.deep_media_top_n_var,
+            self.auto_update_var,
+            *self.source_toggle_vars.values(),
+            *self.telegram_source_toggle_vars.values(),
+        ]
+        for variable in tracked_vars:
+            with contextlib.suppress(Exception):
+                variable.trace_add("write", lambda *_args: self._schedule_dirty_check())
+
+    def _schedule_dirty_check(self, _event=None) -> None:
+        if self._refreshing_controls:
+            return
+        if self._dirty_job is not None:
+            with contextlib.suppress(Exception):
+                self.after_cancel(self._dirty_job)
+        self._dirty_job = self.after(60, self._update_dirty_state)
+
+    def _update_dirty_state(self) -> None:
+        self._dirty_job = None
+        draft = self._collect_settings_payload(validate=False)
+        self._dirty = self._baseline_payload is not None and draft != self._baseline_payload
+        self.refresh_interaction_state()
+
+    def _set_baseline_payload(self, payload: dict[str, object]) -> None:
+        self._baseline_payload = dict(payload)
+        self._dirty = False
+        self.refresh_interaction_state()
+
+    def _schedule_tab_poll(self) -> None:
+        if self._tab_poll_job is not None:
+            with contextlib.suppress(Exception):
+                self.after_cancel(self._tab_poll_job)
+        self._tab_poll_job = self.after(180, self._poll_active_tab)
+
+    def _poll_active_tab(self) -> None:
+        self._tab_poll_job = None
+        current_tab = ""
+        with contextlib.suppress(Exception):
+            current_tab = str(self.tabs.get() or "")
+        if current_tab and current_tab != self._active_tab_name:
+            self._active_tab_name = current_tab
+            self._handle_active_tab_changed(current_tab)
+        if self.winfo_exists():
+            self._schedule_tab_poll()
+
+    def _handle_active_tab_changed(self, tab_name: str) -> None:
+        about_tab_name = getattr(self, "_about_tab_name", "")
+        if not about_tab_name:
+            return
+        if tab_name == about_tab_name:
+            self._ensure_about_video_preview()
+        else:
+            self._release_about_video_preview()
+
+    def _ensure_about_video_preview(self) -> None:
+        if not hasattr(self, "about_video_wrap") or self.about_video_preview is not None:
+            return
+        if hasattr(self, "about_video_placeholder") and self.about_video_placeholder is not None:
+            with contextlib.suppress(Exception):
+                self.about_video_placeholder.destroy()
+            self.about_video_placeholder = None
+        self.about_video_preview = LoopingVideoPreview(
+            self.about_video_wrap,
+            video_path=ABOUT_VIDEO_PATH,
+            width=620,
+            height=348,
+        )
+        self.about_video_preview.pack(fill="x", padx=0, pady=0)
+
+    def _release_about_video_preview(self) -> None:
+        video_widget = getattr(self, "about_video_preview", None)
+        if video_widget is not None:
+            with contextlib.suppress(Exception):
+                video_widget.destroy()
+            self.about_video_preview = None
+        if hasattr(self, "about_video_wrap") and getattr(self, "about_video_placeholder", None) is None:
+            self.about_video_placeholder = ctk.CTkLabel(
+                self.about_video_wrap,
+                text="Откройте вкладку «О приложении», чтобы загрузить preview.",
+                text_color=COLOR_TEXT_SOFT,
+                font=("Segoe UI", 11),
+                justify="center",
+                wraplength=560,
+            )
+            self.about_video_placeholder.pack(fill="x", padx=16, pady=22)
 
     def _create_variables(self) -> None:
         config = self.app.runtime.config
@@ -1940,6 +2289,7 @@ class SettingsDialog(ctk.CTkToplevel):
         pool = self.tabs.add("Пул")
         logs = self.tabs.add("Логи")
         authors = self.tabs.add("О приложении")
+        self._about_tab_name = "О приложении"
 
         self._build_general_tab(general)
         self._build_telegram_tab(telegram)
@@ -2248,6 +2598,9 @@ class SettingsDialog(ctk.CTkToplevel):
         )
         self.telegram_sources_box.pack(fill="x", padx=18, pady=(0, 10))
         _bind_clipboard_shortcuts(self.telegram_sources_box)
+        self.telegram_sources_box.bind("<KeyRelease>", self._schedule_dirty_check, add="+")
+        self.telegram_sources_box.bind("<<Paste>>", self._schedule_dirty_check, add="+")
+        self.telegram_sources_box.bind("<<Cut>>", self._schedule_dirty_check, add="+")
         self.thread_requirement_label = ctk.CTkLabel(
             source_card,
             text="",
@@ -2436,6 +2789,9 @@ class SettingsDialog(ctk.CTkToplevel):
         )
         self.custom_sources_box.pack(fill="x", padx=18, pady=(0, 18))
         _bind_clipboard_shortcuts(self.custom_sources_box)
+        self.custom_sources_box.bind("<KeyRelease>", self._schedule_dirty_check, add="+")
+        self.custom_sources_box.bind("<<Paste>>", self._schedule_dirty_check, add="+")
+        self.custom_sources_box.bind("<<Cut>>", self._schedule_dirty_check, add="+")
 
         tuning = ctk.CTkFrame(outer, corner_radius=22, fg_color=COLOR_CARD, border_width=1, border_color=COLOR_BORDER)
         tuning.pack(fill="x", pady=(0, 12))
@@ -2616,13 +2972,18 @@ class SettingsDialog(ctk.CTkToplevel):
             wraplength=620,
         ).pack(anchor="w", padx=18, pady=(0, 16))
 
-        self.about_video_preview = LoopingVideoPreview(
-            card,
-            video_path=ABOUT_VIDEO_PATH,
-            width=620,
-            height=348,
+        self.about_video_wrap = ctk.CTkFrame(card, corner_radius=22, fg_color=COLOR_FIELD, border_width=1, border_color=COLOR_FIELD_BORDER)
+        self.about_video_wrap.pack(fill="x", padx=18, pady=(0, 16))
+        self.about_video_preview: LoopingVideoPreview | None = None
+        self.about_video_placeholder = ctk.CTkLabel(
+            self.about_video_wrap,
+            text="Откройте вкладку «О приложении», чтобы загрузить preview.",
+            text_color=COLOR_TEXT_SOFT,
+            font=("Segoe UI", 11),
+            justify="center",
+            wraplength=560,
         )
-        self.about_video_preview.pack(fill="x", padx=18, pady=(0, 16))
+        self.about_video_placeholder.pack(fill="x", padx=16, pady=22)
 
         self._about_link_row(
             card,
@@ -2828,8 +3189,207 @@ class SettingsDialog(ctk.CTkToplevel):
             _bind_clipboard_shortcuts(entry)
             grid.grid_columnconfigure(column, weight=1)
 
-    def refresh_from_runtime(self) -> None:
+    def _collect_settings_payload(self, *, validate: bool) -> dict[str, object]:
+        payload = asdict(self.app.runtime.config)
+
+        def _invalid(field: str, value: object) -> str:
+            return f"__invalid__:{field}:{str(value).strip()}"
+
+        def _read_int_maybe(value: object, field: str, *, allow_zero: bool = False) -> int | str:
+            try:
+                return _read_int(str(value).strip(), field, allow_zero=allow_zero)
+            except Exception:
+                if validate:
+                    raise
+                return _invalid(field, value)
+
+        def _read_float_maybe(value: object, field: str) -> float | str:
+            try:
+                return _read_float(str(value).strip(), field)
+            except Exception:
+                if validate:
+                    raise
+                return _invalid(field, value)
+
+        payload["autostart_enabled"] = bool(self.autostart_var.get())
+        payload["start_minimized_to_tray"] = bool(self.start_minimized_var.get())
+        payload["auto_start_local"] = bool(self.auto_start_local_var.get())
+        payload["appearance"] = next((code for code, label in APPEARANCE_LABELS.items() if label == self.appearance_var.get()), "auto")
+        payload["close_behavior"] = _close_code(self.close_behavior_var.get())
+        payload["local_host"] = self.local_host_var.get().strip() or "127.0.0.1"
+        payload["local_port"] = _read_int_maybe(self.local_port_var.get(), "local_port")
+        payload["local_secret"] = self.local_secret_var.get().strip().lower()
+        payload["local_fake_tls_enabled"] = False
+        payload["local_fake_tls_domain"] = ""
+        payload["telegram_sources_enabled"] = bool(self.telegram_sources_enabled_var.get())
+        payload["telegram_sources"] = self._collect_telegram_sources_from_controls()
+        payload["thread_source_enabled"] = payload["telegram_sources_enabled"]
+        payload["thread_source_url"] = payload["telegram_sources"][0] if payload["telegram_sources"] else ""
+        payload["telegram_phone"] = ""
+        payload["duration"] = _read_float_maybe(self.duration_var.get(), "duration")
+        payload["interval"] = _read_float_maybe(self.interval_var.get(), "interval")
+        payload["timeout"] = _read_float_maybe(self.timeout_var.get(), "timeout")
+        payload["workers"] = _read_int_maybe(self.workers_var.get(), "workers")
+        payload["fetch_timeout"] = _read_float_maybe(self.fetch_timeout_var.get(), "fetch_timeout")
+        payload["max_latency_ms"] = _read_float_maybe(self.max_latency_var.get(), "max_latency_ms")
+        payload["min_success_rate"] = _read_float_maybe(self.min_success_var.get(), "min_success_rate")
+        payload["max_high_latency_ratio"] = _read_float_maybe(self.high_ratio_var.get(), "max_high_latency_ratio")
+        payload["high_latency_streak"] = _read_int_maybe(self.high_streak_var.get(), "high_latency_streak")
+        payload["max_proxies"] = _read_int_maybe(self.max_proxies_var.get() or "0", "max_proxies", allow_zero=True)
+        payload["live_probe_interval_sec"] = _read_int_maybe(self.live_probe_interval_var.get(), "live_probe_interval_sec")
+        payload["live_probe_duration_sec"] = _read_float_maybe(self.live_probe_duration_var.get(), "live_probe_duration_sec")
+        payload["live_probe_top_n"] = _read_int_maybe(self.live_probe_top_n_var.get(), "live_probe_top_n")
+        payload["deep_media_enabled"] = bool(self.deep_media_enabled_var.get())
+        payload["rf_whitelist_check_enabled"] = bool(self.rf_whitelist_check_var.get())
+        payload["deep_media_top_n"] = _read_int_maybe(self.deep_media_top_n_var.get(), "deep_media_top_n")
+        payload["auto_update_enabled"] = bool(self.auto_update_var.get())
+        payload["sources"] = self._collect_sources_from_controls()
+        payload["telegram_api_id"] = _read_int_maybe(self.telegram_api_id_var.get() or "0", "telegram_api_id", allow_zero=True)
+        payload["telegram_api_hash"] = self.telegram_api_hash_var.get().strip()
+
+        if validate:
+            if not payload["local_secret"]:
+                raise ValueError("local_secret is required")
+            if payload["local_fake_tls_domain"]:
+                str(payload["local_fake_tls_domain"]).encode("ascii")
+            if not payload["sources"]:
+                raise ValueError("sources list is empty")
+            if bool(payload["telegram_sources_enabled"] or payload["deep_media_enabled"] or payload["rf_whitelist_check_enabled"]):
+                if not payload["telegram_api_id"] or not str(payload["telegram_api_hash"]).strip():
+                    raise ValueError("Для функций Telegram необходимо указать API ID и API Hash")
+        return payload
+
+    def _refresh_config_controls_from_runtime(self, config: AppConfig) -> None:
+        self._refreshing_controls = True
+        try:
+            self.autostart_var.set(bool(config.autostart_enabled))
+            self.start_minimized_var.set(bool(config.start_minimized_to_tray))
+            self.auto_start_local_var.set(bool(config.auto_start_local))
+            self.appearance_var.set(_appearance_label(config.appearance))
+            self.close_behavior_var.set(CLOSE_LABELS.get(config.close_behavior, CLOSE_LABELS["ask"]))
+            self.telegram_sources_enabled_var.set(bool(getattr(config, "telegram_sources_enabled", config.thread_source_enabled)))
+            self.deep_media_enabled_var.set(bool(getattr(config, "deep_media_enabled", False)))
+            self.rf_whitelist_check_var.set(bool(getattr(config, "rf_whitelist_check_enabled", False)))
+            self.local_host_var.set(config.local_host)
+            self.local_port_var.set(str(config.local_port))
+            self.local_secret_var.set(config.local_secret)
+            self.telegram_api_id_var.set(str(config.telegram_api_id or ""))
+            self.telegram_api_hash_var.set(config.telegram_api_hash)
+            self.duration_var.set(str(config.duration))
+            self.interval_var.set(str(config.interval))
+            self.timeout_var.set(str(config.timeout))
+            self.workers_var.set(str(config.workers))
+            self.fetch_timeout_var.set(str(config.fetch_timeout))
+            self.max_latency_var.set(str(config.max_latency_ms))
+            self.min_success_var.set(str(config.min_success_rate))
+            self.high_ratio_var.set(str(config.max_high_latency_ratio))
+            self.high_streak_var.set(str(config.high_latency_streak))
+            self.max_proxies_var.set(str(config.max_proxies))
+            self.live_probe_interval_var.set(str(config.live_probe_interval_sec))
+            self.live_probe_duration_var.set(str(config.live_probe_duration_sec))
+            self.live_probe_top_n_var.set(str(config.live_probe_top_n))
+            self.deep_media_top_n_var.set(str(config.deep_media_top_n))
+            self.auto_update_var.set(bool(getattr(config, "auto_update_enabled", True)))
+
+            configured_sources = list(config.sources)
+            for source, variable in self.source_toggle_vars.items():
+                variable.set(source in configured_sources)
+            self.custom_sources_box.delete("1.0", "end")
+            custom_sources = [source for source in configured_sources if source not in self.source_toggle_vars]
+            if custom_sources:
+                self.custom_sources_box.insert("1.0", "\n".join(custom_sources))
+
+            configured_telegram_sources = list(getattr(config, "telegram_sources", []) or [])
+            for source, variable in self.telegram_source_toggle_vars.items():
+                variable.set(source in configured_telegram_sources)
+            telegram_textbox = getattr(self.telegram_sources_box, "_textbox", self.telegram_sources_box)
+            telegram_box_state = str(telegram_textbox.cget("state"))
+            if telegram_box_state == "disabled":
+                telegram_textbox.configure(state="normal")
+            self.telegram_sources_box.delete("1.0", "end")
+            custom_telegram_sources = [source for source in configured_telegram_sources if source not in self.telegram_source_toggle_vars]
+            if custom_telegram_sources:
+                self.telegram_sources_box.insert("1.0", "\n".join(custom_telegram_sources))
+            if telegram_box_state == "disabled":
+                telegram_textbox.configure(state="disabled")
+        finally:
+            self._refreshing_controls = False
+        self._set_baseline_payload(self._collect_settings_payload(validate=False))
+
+    def _refresh_runtime_status(self, config: AppConfig, snapshot: dict[str, object]) -> None:
+        auth = self.app.auth_status
+        if auth.get("authorized"):
+            status_text = f"Сессия активна: {auth.get('display') or auth.get('phone')}"
+        elif auth.get("session_exists"):
+            status_text = "Сессия найдена, но авторизация не подтверждена"
+        else:
+            status_text = "Сессия Telegram не подключена"
+        if not (config.telegram_api_id and config.telegram_api_hash.strip()):
+            status_text = "Для входа в Telegram укажите свои API ID и API Hash"
+        self.auth_status_label.configure(text=status_text)
+        if auth.get("authorized"):
+            self._set_password_row_visible(False)
+
+        thread_text = _format_thread_status(
+            str(snapshot.get("thread_status", "")),
+            int(snapshot.get("thread_proxy_count", 0)),
+            enabled=bool(getattr(config, "telegram_sources_enabled", config.thread_source_enabled)),
+        )
+        if auth.get("authorized") and str(snapshot.get("thread_status", "")) == "skipped:telegram_session_not_authorized":
+            thread_text = "Сессия активна. Обновите список, чтобы заново проверить Telegram-источники."
+        self.thread_status_label.configure(text=thread_text)
+
+        pool_rows = list(snapshot.get("pool_rows", [])[:100])
+        pool_signature = tuple(
+            (
+                row.get("host"),
+                row.get("port"),
+                row.get("live_latency_ms"),
+                row.get("base_latency_ms"),
+                row.get("score"),
+                row.get("media_score"),
+                row.get("last_error"),
+                row.get("reason"),
+                row.get("url"),
+            )
+            for row in pool_rows
+        )
+        if pool_signature != self._last_pool_signature:
+            self._last_pool_signature = pool_signature
+            for item in self.pool_tree.get_children():
+                self.pool_tree.delete(item)
+            for row in pool_rows:
+                state = row.get("last_error") or row.get("reason") or "ok"
+                self.pool_tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        row.get("host"),
+                        row.get("port"),
+                        _format_latency(_safe_float(row.get("live_latency_ms") or row.get("base_latency_ms"))),
+                        f"{_safe_float(row.get('score')) or 0:.0f}",
+                        _format_media(row.get("media_score")),
+                        state,
+                    ),
+                    tags=(str(row.get("url", "")),),
+                )
+
+        logs_text = "\n".join(self.app.log_lines[-250:])
+        logs_signature = (len(self.app.log_lines), logs_text)
+        if logs_signature != self._last_logs_signature:
+            self._last_logs_signature = logs_signature
+            self.logs_box.delete("1.0", "end")
+            self.logs_box.insert("1.0", logs_text)
+
+        self._refresh_requirement_hints()
+
+    def refresh_from_runtime(self, *, force_config: bool = False) -> None:
         config, snapshot = self.app.get_runtime_state(allow_stale=True)
+        self._refresh_runtime_status(config, snapshot)
+        if force_config or not self._dirty or self._baseline_payload is None:
+            self._refresh_config_controls_from_runtime(config)
+        self.refresh_interaction_state()
+        return
         self.appearance_var.set(_appearance_label(config.appearance))
         self.deep_media_enabled_var.set(bool(getattr(config, "deep_media_enabled", False)))
         self.rf_whitelist_check_var.set(bool(getattr(config, "rf_whitelist_check_enabled", False)))
@@ -2932,6 +3492,8 @@ class SettingsDialog(ctk.CTkToplevel):
         ):
             if widget is not None:
                 widget.configure(state="disabled" if busy else "normal")
+        if hasattr(self, "save_button"):
+            self.save_button.configure(state="normal" if (self._dirty and not busy) else "disabled")
         if hasattr(self, "install_update_button"):
             update_available = bool(self.app.update_info.get("available"))
             update_busy = bool(self.app.update_info.get("checking"))
@@ -3195,6 +3757,24 @@ class SettingsDialog(ctk.CTkToplevel):
 
     def _save_settings(self) -> None:
         try:
+            payload = self._collect_settings_payload(validate=True)
+            if self._baseline_payload is not None and payload == self._baseline_payload:
+                self._set_baseline_payload(payload)
+                return
+            appearance_changed = str(payload.get("appearance")) != self.app.runtime.config.appearance
+            changed = self.app.apply_config(AppConfig(**payload))
+        except Exception as exc:
+            messagebox.showerror("Настройки не сохранены", str(exc), parent=self.app)
+            return
+        if self.winfo_exists():
+            self._set_baseline_payload(payload)
+        if not changed:
+            return
+        if not appearance_changed and self.winfo_exists():
+            self.refresh_from_runtime(force_config=True)
+        messagebox.showinfo("Настройки", "Параметры сохранены", parent=self.app, dedupe_key="settings_saved")
+        return
+        try:
             payload = asdict(self.app.runtime.config)
             appearance_code = next((code for code, label in APPEARANCE_LABELS.items() if label == self.appearance_var.get()), "auto")
             appearance_changed = appearance_code != self.app.runtime.config.appearance
@@ -3251,6 +3831,7 @@ class SettingsDialog(ctk.CTkToplevel):
         messagebox.showinfo("Настройки", "Параметры сохранены", parent=self.app)
 
     def _save_without_message(self) -> bool:
+        return self._save_before_auth()
         try:
             self._save_settings()
             return True
@@ -3345,6 +3926,19 @@ class SettingsDialog(ctk.CTkToplevel):
 
     def _save_before_auth(self) -> bool:
         try:
+            payload = self._collect_settings_payload(validate=True)
+            if not payload["telegram_api_id"] or not payload["telegram_api_hash"]:
+                raise ValueError("Для входа в Telegram необходимо указать API ID и API Hash")
+            changed = self.app.apply_config(AppConfig(**payload))
+            if self.winfo_exists():
+                self._set_baseline_payload(payload)
+            if changed and self.winfo_exists():
+                self.refresh_from_runtime(force_config=True)
+            return True
+        except Exception as exc:
+            messagebox.showerror("Настройки не сохранены", str(exc), parent=self.app)
+            return False
+        try:
             payload = asdict(self.app.runtime.config)
             payload["autostart_enabled"] = bool(self.autostart_var.get())
             payload["start_minimized_to_tray"] = bool(self.start_minimized_var.get())
@@ -3378,6 +3972,15 @@ class SettingsDialog(ctk.CTkToplevel):
             return False
 
     def _close(self) -> None:
+        self._release_about_video_preview()
+        if self._dirty_job is not None:
+            with contextlib.suppress(Exception):
+                self.after_cancel(self._dirty_job)
+            self._dirty_job = None
+        if self._tab_poll_job is not None:
+            with contextlib.suppress(Exception):
+                self.after_cancel(self._tab_poll_job)
+            self._tab_poll_job = None
         # FIX: явно останавливаем видео-виджет при закрытии окна
         video_widget = getattr(self, "about_video_preview", None)
         if video_widget is not None:
