@@ -291,6 +291,9 @@ class _PrimaryMonitorModal(ctk.CTkToplevel):
         super().__init__(owner)
         self.result: str | None = None
         self._buttons = buttons
+        # Withdraw сразу — не даём CTkToplevel мелькнуть до того как виджеты построены.
+        # grab_set() НЕ вызываем здесь: grab на скрытом окне захватывает все события,
+        # но окно невидимо → приложение зависает. grab_set() переехал в _show_ready().
         self.withdraw()
         self.title(title)
         with contextlib.suppress(Exception):
@@ -298,7 +301,6 @@ class _PrimaryMonitorModal(ctk.CTkToplevel):
                 self.iconbitmap(str(APP_ICON_PATH))
         _set_fixed_window_size(self, 460, 240 if len(buttons) == 1 else 250, primary_monitor=True)
         self.transient(owner)
-        self.grab_set()
         self.configure(fg_color=COLOR_BG)
         self.protocol("WM_DELETE_WINDOW", self._cancel)
         self.bind("<Escape>", lambda _event: self._cancel(), add="+")
@@ -364,13 +366,17 @@ class _PrimaryMonitorModal(ctk.CTkToplevel):
                 command=lambda value=button_name: self._choose(value),
             ).grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 6, 0 if index == len(buttons) - 1 else 6))
 
-        self.after(0, self._show_ready)
+        # Небольшая задержка чтобы CTkToplevel завершил внутреннюю инициализацию
+        # (масштабирование DPI и т.п.) до того как мы показываем окно и ставим grab.
+        self.after(50, self._show_ready)
 
     def _show_ready(self) -> None:
         with contextlib.suppress(Exception):
             self.deiconify()
+            self.update_idletasks()  # позволить Tk отрисовать виджеты
             self.lift()
             self.focus_force()
+            self.grab_set()  # grab ТОЛЬКО после того как окно реально видно
 
     def _choose(self, value: str) -> None:
         self.result = value
