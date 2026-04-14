@@ -31,6 +31,7 @@ from mtproxy_telegram import (
     DEFAULT_SOURCE_MAX_AGE_DAYS,
     DEFAULT_TELEGRAM_SOURCE_URLS,
     TelegramAuthConfig,
+    auth_is_configured,
     collect_telegram_sources_proxies,
     collect_thread_proxies,
     complete_login,
@@ -441,8 +442,19 @@ class AppRuntime:
         )
 
     def run_auth_status(self) -> dict[str, Any]:
+        cfg = self.auth_config
+        # FIX: не вызываем API если credentials не настроены — иначе при старте
+        # приложения показывается ошибка "telegram_api_credentials_missing".
+        if not auth_is_configured(cfg):
+            session_path = (self.root_dir / self.config.telegram_session_file).resolve()
+            return {
+                "authorized": False,
+                "display": "",
+                "phone": "",
+                "session_exists": session_path.exists(),
+            }
         with self.telegram_lock:
-            return run_async(get_auth_status(self.auth_config, upstream_proxy=self._best_proxy()))
+            return run_async(get_auth_status(cfg, upstream_proxy=self._best_proxy()))
 
     def request_auth_code(self, phone: str) -> dict[str, Any]:
         with self.telegram_lock:
