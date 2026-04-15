@@ -950,11 +950,7 @@ async def _download_sample_bytes(
     started_at = time.perf_counter()
     downloaded = 0
     try:
-        try:
         iterator = client.iter_download(message.media, request_size=64 * 1024)
-    except (TypeError, AttributeError, ValueError):
-        # media-тип не поддерживает скачивание (geo, contact, etc.)
-        return (time.perf_counter() - started_at) * 1000.0, 0
     except (TypeError, AttributeError, ValueError):
         # media-тип не поддерживает скачивание (geo, contact, etc.)
         return (time.perf_counter() - started_at) * 1000.0, 0
