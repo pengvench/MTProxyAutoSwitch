@@ -3588,7 +3588,25 @@ class SettingsDialog(ctk.CTkToplevel):
             if widget is not None:
                 widget.configure(state="disabled" if busy else "normal")
         if hasattr(self, "save_button"):
-            self.save_button.configure(state="normal" if (self._dirty and not busy) else "disabled")
+            if self._dirty:
+                self.save_button.configure(
+                    state="disabled" if busy else "normal",
+                    text="Сохранить",
+                    fg_color=COLOR_ACCENT,
+                    hover_color=COLOR_ACCENT_HOVER,
+                    text_color="#FFFFFF",
+                    command=self._save_settings,
+                )
+            else:
+                # Изменений нет — кнопка становится красной «Закрыть»
+                self.save_button.configure(
+                    state="normal",
+                    text="Закрыть",
+                    fg_color=COLOR_DANGER_BG,
+                    hover_color=COLOR_DANGER_BORDER,
+                    text_color=COLOR_DANGER_TEXT,
+                    command=self._close,
+                )
         if hasattr(self, "install_update_button"):
             update_available = bool(self.app.update_info.get("available"))
             update_busy = bool(self.app.update_info.get("checking"))
@@ -3619,28 +3637,42 @@ class SettingsDialog(ctk.CTkToplevel):
         rf_whitelist_enabled = bool(self.rf_whitelist_check_var.get())
 
         if hasattr(self, "thread_requirement_label"):
-            if thread_enabled and not is_authorized:
-                self.thread_requirement_label.configure(
-                    text="Для парса Telegram-источников нужна авторизованная Telegram-сессия. Без входа каналы, группы и ветки через Telegram API будут пропущены."
-                )
-                if not self.thread_requirement_label.winfo_manager():
-                    self.thread_requirement_label.pack(anchor="w", padx=18, pady=(0, 8), before=self.thread_status_label)
-            else:
-                self.thread_requirement_label.configure(text="")
-                if self.thread_requirement_label.winfo_manager():
-                    self.thread_requirement_label.pack_forget()
+            try:
+                if thread_enabled and not is_authorized:
+                    self.thread_requirement_label.configure(
+                        text="Для парса Telegram-источников нужна авторизованная Telegram-сессия. "
+                             "Без входа каналы, группы и ветки через Telegram API будут пропущены."
+                    )
+                    if not self.thread_requirement_label.winfo_manager():
+                        self.thread_requirement_label.pack(
+                            anchor="w", padx=18, pady=(0, 8),
+                            before=self.thread_status_label,
+                        )
+                else:
+                    self.thread_requirement_label.configure(text="")
+                    if self.thread_requirement_label.winfo_manager():
+                        self.thread_requirement_label.pack_forget()
+            except Exception:
+                pass
 
         if hasattr(self, "deep_media_requirement_label"):
-            if (deep_media_enabled or rf_whitelist_enabled) and not is_authorized:
-                self.deep_media_requirement_label.configure(
-                    text="Media-проверки требуют авторизованную Telegram-сессию. Без входа deep media check и РФ white-list check будут пропущены."
-                )
-                if not self.deep_media_requirement_label.winfo_manager():
-                    self.deep_media_requirement_label.pack(anchor="w", padx=18, pady=(0, 10), before=self.advanced_probe_frame)
-            else:
-                self.deep_media_requirement_label.configure(text="")
-                if self.deep_media_requirement_label.winfo_manager():
-                    self.deep_media_requirement_label.pack_forget()
+            try:
+                if (deep_media_enabled or rf_whitelist_enabled) and not is_authorized:
+                    self.deep_media_requirement_label.configure(
+                        text="Media-проверки требуют авторизованную Telegram-сессию. "
+                             "Без входа deep media check и РФ white-list check будут пропущены."
+                    )
+                    if not self.deep_media_requirement_label.winfo_manager():
+                        self.deep_media_requirement_label.pack(
+                            anchor="w", padx=18, pady=(0, 10),
+                            before=self.advanced_probe_frame,
+                        )
+                else:
+                    self.deep_media_requirement_label.configure(text="")
+                    if self.deep_media_requirement_label.winfo_manager():
+                        self.deep_media_requirement_label.pack_forget()
+            except Exception:
+                pass
 
     def _set_all_sources_enabled(self) -> None:
         for variable in self.source_toggle_vars.values():

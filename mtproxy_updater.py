@@ -142,9 +142,19 @@ def _build_update_script(*, source_dir: Path, install_dir: Path, exe_name: str) 
     return (
         "@echo off\n"
         "setlocal\n"
-        "timeout /t 5 /nobreak >nul\n"
-        f'robocopy "{src}" "{dst}" /E /R:2 /W:1 /NFL /NDL /NJH /NJS /NP >nul\n'
-        f'if exist "{exe}" start "" "{exe}"\n'
+        # 1. Дать время приложению завершиться
+        "timeout /t 3 /nobreak >nul\n"
+        # 2. Принудительно убить процесс если ещё живой
+        f'taskkill /f /im "{exe_name}" /t >nul 2>&1\n'
+        "timeout /t 2 /nobreak >nul\n"
+        # 3. Копируем файлы (robocopy: exitcode 0-7 = успех)
+        f'robocopy "{src}" "{dst}" /E /R:3 /W:2 /NFL /NDL /NJH /NJS /NP >nul\n'
+        # 4. Запускаем только при успешном копировании
+        "if %errorlevel% leq 7 (\n"
+        f'    if exist "{exe}" start "" "{exe}"\n'
+        ") else (\n"
+        '    echo Update failed with robocopy error %errorlevel% >> "%~dp0update_error.log"\n'
+        ")\n"
         'del "%~f0"\n'
         "endlocal\n"
     )

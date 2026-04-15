@@ -927,7 +927,8 @@ def _detect_media_kind(message: Any) -> str | None:
     document = getattr(message, "document", None)
     if document is None:
         media = getattr(message, "media", None)
-        document = getattr(getattr(media, "document", None), "document", None)
+        # Исправлено: убрано двойное разыменование .document.document
+        document = getattr(media, "document", None)
 
     if document is None:
         return None
@@ -948,7 +949,15 @@ async def _download_sample_bytes(
 ) -> tuple[float, int]:
     started_at = time.perf_counter()
     downloaded = 0
-    iterator = client.iter_download(message.media, request_size=64 * 1024)
+    try:
+        try:
+        iterator = client.iter_download(message.media, request_size=64 * 1024)
+    except (TypeError, AttributeError, ValueError):
+        # media-тип не поддерживает скачивание (geo, contact, etc.)
+        return (time.perf_counter() - started_at) * 1000.0, 0
+    except (TypeError, AttributeError, ValueError):
+        # media-тип не поддерживает скачивание (geo, contact, etc.)
+        return (time.perf_counter() - started_at) * 1000.0, 0
     deadline = time.perf_counter() + max(2.0, float(timeout))
     while True:
         if time.perf_counter() >= deadline:
