@@ -1,4 +1,4 @@
-# macOS Public Build Guide
+# macOS Build Guide
 
 ## Requirements
 
@@ -17,8 +17,8 @@ xcode-select --install
 Open Terminal in the project folder and run:
 
 ```bash
-chmod +x build_release_public_macos.sh
-./build_release_public_macos.sh
+chmod +x build_release_macos.sh
+./build_release_macos.sh
 ```
 
 The build script installs these dependencies automatically:
@@ -46,7 +46,7 @@ pyobjc-framework-Quartz
 The application bundle will be created at:
 
 ```text
-release-macos/MTProxyAutoSwitchPublic/MTProxyAutoSwitchPublic.app
+release-macos/MTProxyAutoSwitch/MTProxyAutoSwitch.app
 ```
 
 The script also copies:
@@ -64,23 +64,23 @@ On macOS the build now targets the current CPU architecture by default:
 If you really need a different target, override it explicitly:
 
 ```bash
-MTPROXY_TARGET_ARCH=universal2 ./build_release_public_macos.sh
+MTPROXY_TARGET_ARCH=universal2 ./build_release_macos.sh
 ```
 
-When the app runs from a `.app` bundle, it first looks for `config.json`, `.env` and `list/` next to the bundle in `release-macos/MTProxyAutoSwitchPublic/`.
-If that folder is not writable, it falls back to `~/Library/Application Support/MTProxyAutoSwitchPublic/`.
+When the app runs from a `.app` bundle, it first looks for `config.json`, `.env` and `list/` next to the bundle in `release-macos/MTProxyAutoSwitch/`.
+The app stores mutable state in `~/Library/Application Support/MTProxyAutoSwitch/`.
 
 ## Gatekeeper
 
 If macOS blocks the app on first launch, remove quarantine attributes:
 
 ```bash
-xattr -dr com.apple.quarantine release-macos/MTProxyAutoSwitchPublic/MTProxyAutoSwitchPublic.app
+xattr -dr com.apple.quarantine release-macos/MTProxyAutoSwitch/MTProxyAutoSwitch.app
 ```
 
 ## Telegram API credentials
 
-This public build does not include embedded Telegram API credentials.
+The release build does not include embedded Telegram API credentials.
 
 If the user wants Telegram API features, they need their own:
 

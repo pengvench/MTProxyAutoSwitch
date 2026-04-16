@@ -12,11 +12,12 @@ from typing import Any, Callable
 
 from mtproxy_net import create_verified_ssl_context
 
-APP_PUBLIC_VERSION = "1.2"
+APP_VERSION = "1.2"
+APP_PUBLIC_VERSION = APP_VERSION
 GITHUB_REPO = "pengvench/MTProxyAutoSwitch"
 LATEST_RELEASE_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 LATEST_RELEASE_PAGE_URL = f"https://github.com/{GITHUB_REPO}/releases/latest"
-PUBLIC_WINDOWS_ASSET = "MTProxyAutoSwitchPublic.zip"
+WINDOWS_ASSET_CANDIDATES = ("MTProxyAutoSwitch.zip", "MTProxyAutoSwitchPublic.zip")
 USER_AGENT = "MTProxyAutoSwitchUpdater/1.2"
 URLLIB_SSL_CONTEXT = create_verified_ssl_context()
 
@@ -57,7 +58,7 @@ def prepare_windows_update(
     *,
     install_dir: Path,
     state_dir: Path,
-    current_version: str = APP_PUBLIC_VERSION,
+    current_version: str = APP_VERSION,
     progress_sink: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     release = fetch_latest_release()
@@ -126,19 +127,20 @@ def _resolve_update_root(root: Path) -> Path:
 
 
 def _detect_executable_name(install_dir: Path) -> str:
-    preferred = ["MTProxyAutoSwitchPublic.exe", "MTProxyAutoSwitch.exe"]
+    preferred = ["MTProxyAutoSwitch.exe", "MTProxyAutoSwitchPublic.exe"]
     for name in preferred:
         if (install_dir / name).exists():
             return name
     for path in install_dir.glob("*.exe"):
         return path.name
-    return "MTProxyAutoSwitchPublic.exe"
+    return "MTProxyAutoSwitch.exe"
 
 
 def _build_update_script(*, source_dir: Path, install_dir: Path, exe_name: str) -> str:
     src = str(source_dir.resolve())
     dst = str(install_dir.resolve())
     exe = str((install_dir / exe_name).resolve())
+    internal_dir = str((install_dir / "_internal").resolve())
     return (
         "@echo off\n"
         "setlocal\n"
@@ -148,10 +150,12 @@ def _build_update_script(*, source_dir: Path, install_dir: Path, exe_name: str) 
         f'taskkill /f /im "{exe_name}" /t >nul 2>&1\n'
         "timeout /t 2 /nobreak >nul\n"
         # 3. Копируем файлы (robocopy: exitcode 0-7 = успех)
-        f'robocopy "{src}" "{dst}" /E /R:3 /W:2 /NFL /NDL /NJH /NJS /NP >nul\n'
+        f'robocopy "{src}" "{dst}" /E /R:10 /W:3 /NFL /NDL /NJH /NJS /NP /XD "updates" >nul\n'
         # 4. Запускаем только при успешном копировании
         "if %errorlevel% leq 7 (\n"
-        f'    if exist "{exe}" start "" "{exe}"\n'
+        f'    if not exist "{exe}" echo Update failed: missing executable >> "%~dp0update_error.log"\n'
+        f'    if not exist "{internal_dir}" echo Update failed: missing _internal dir >> "%~dp0update_error.log"\n'
+        f'    if exist "{exe}" if exist "{internal_dir}" start "" /d "{dst}" "{exe}"\n'
         ") else (\n"
         '    echo Update failed with robocopy error %errorlevel% >> "%~dp0update_error.log"\n'
         ")\n"
@@ -187,7 +191,7 @@ def _fetch_latest_release_via_api(timeout: float) -> ReleaseInfo:
     selected_asset: ReleaseAsset | None = None
     for item in assets:
         name = str(item.get("name") or "")
-        if name == PUBLIC_WINDOWS_ASSET:
+        if name in WINDOWS_ASSET_CANDIDATES:
             selected_asset = ReleaseAsset(
                 name=name,
                 url=str(item.get("browser_download_url") or ""),
@@ -234,8 +238,8 @@ def _fetch_latest_release_via_page(timeout: float) -> ReleaseInfo:
             tag_name = match.group(1).strip().strip("/")
 
     asset = ReleaseAsset(
-        name=PUBLIC_WINDOWS_ASSET,
-        url=f"https://github.com/{GITHUB_REPO}/releases/latest/download/{PUBLIC_WINDOWS_ASSET}",
+        name=WINDOWS_ASSET_CANDIDATES[0],
+        url=f"https://github.com/{GITHUB_REPO}/releases/latest/download/{WINDOWS_ASSET_CANDIDATES[0]}",
         size=0,
     )
     return ReleaseInfo(

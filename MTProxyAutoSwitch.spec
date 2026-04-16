@@ -1,11 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
 # Правильная сборка: collect_all() копирует imageio как data-файлы
 # (v2.py, plugins/*.py, config/*.py) и ffmpeg в imageio_ffmpeg/binaries/
-import os
 import tempfile
 import pathlib
-
-os.environ['MTPROXY_PUBLIC_RELEASE'] = '1'
 
 from PyInstaller.utils.hooks import collect_all
 
@@ -18,7 +15,6 @@ imageio_ffmpeg_datas, imageio_ffmpeg_binaries, imageio_ffmpeg_hidden = collect_a
 # Runtime hook
 _hook_code = (
     "import os, sys, pathlib\n"
-    "os.environ.setdefault('MTPROXY_PUBLIC_RELEASE', '1')\n"
     "if getattr(sys, 'frozen', False):\n"
     "    _d = pathlib.Path(sys._MEIPASS)\n"
     "    for _p in ('imageio_ffmpeg/binaries/ffmpeg*.exe',\n"
@@ -76,7 +72,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='MTProxyAutoSwitchPublic',
+    name='MTProxyAutoSwitch',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -97,5 +93,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='MTProxyAutoSwitchPublic',
+    name='MTProxyAutoSwitch',
 )

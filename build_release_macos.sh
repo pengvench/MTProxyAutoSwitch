@@ -39,19 +39,19 @@ python3 -m pip install --upgrade \
 rm -rf build dist release-macos
 
 # ✅ Исправлено: вызов через модуль вместо прямого вызова команды
-python3 -m PyInstaller --noconfirm --clean MTProxyAutoSwitchPublic_macos.spec
+python3 -m PyInstaller --noconfirm --clean MTProxyAutoSwitch_macos.spec
 
-mkdir -p release-macos/MTProxyAutoSwitchPublic
-cp -R dist/MTProxyAutoSwitchPublic.app release-macos/MTProxyAutoSwitchPublic/
-cp README.md release-macos/MTProxyAutoSwitchPublic/README.txt
-cp config.json release-macos/MTProxyAutoSwitchPublic/config.json
-cp mtproxy_seed.json release-macos/MTProxyAutoSwitchPublic/mtproxy_seed.json
-mkdir -p release-macos/MTProxyAutoSwitchPublic/list
+mkdir -p release-macos/MTProxyAutoSwitch
+cp -R dist/MTProxyAutoSwitch.app release-macos/MTProxyAutoSwitch/
+cp README.md release-macos/MTProxyAutoSwitch/README.txt
+cp config.json release-macos/MTProxyAutoSwitch/config.json
+cp mtproxy_seed.json release-macos/MTProxyAutoSwitch/mtproxy_seed.json
+mkdir -p release-macos/MTProxyAutoSwitch/list
 if [ -f list/proxy_list.txt ]; then 
-    cp list/proxy_list.txt release-macos/MTProxyAutoSwitchPublic/list/proxy_list.txt
+    cp list/proxy_list.txt release-macos/MTProxyAutoSwitch/list/proxy_list.txt
 fi
 if [ -f list/report.json ]; then 
-    cp list/report.json release-macos/MTProxyAutoSwitchPublic/list/report.json
+    cp list/report.json release-macos/MTProxyAutoSwitch/list/report.json
 fi
 
-echo "Build complete: release-macos/MTProxyAutoSwitchPublic"
+echo "Build complete: release-macos/MTProxyAutoSwitch"

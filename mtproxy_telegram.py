@@ -35,17 +35,22 @@ DEFAULT_MEDIA_CHANNELS = ["telegram", "durov", "TelegramTips"]
 DEFAULT_TELEGRAM_SOURCE_URLS = [
     "https://t.me/strbypass/237103",
     "https://t.me/telemtrs/16160",
+    "https://t.me/telemtfreeproxy",
     "https://t.me/mtpro_xyz",
     "https://t.me/ProxyFree_Ru",
 ]
 DEFAULT_AUTH_TIMEOUT = 20.0
 DEFAULT_THREAD_TOTAL_TIMEOUT = 90.0
 DEFAULT_THREAD_REQUEST_TIMEOUT = 12.0
-DEFAULT_THREAD_MAX_MESSAGES = 8000
-DEFAULT_SOURCE_MAX_AGE_DAYS = 7
-THREAD_PROGRESS_EVERY = 200
+DEFAULT_THREAD_MAX_MESSAGES = 350
+DEFAULT_SOURCE_MAX_MESSAGES = DEFAULT_THREAD_MAX_MESSAGES
+DEFAULT_SOURCE_MAX_AGE_DAYS = 5
+DEFAULT_SOURCE_MAX_PROXIES = 80
+THREAD_PROGRESS_EVERY = 50
 DEFAULT_QR_TOTAL_TIMEOUT = 90.0
 SESSION_KEY_FILE_NAME = "session_key.bin"
+DPI_WINDOW_MIN_BYTES = 14 * 1024
+DPI_WINDOW_MAX_BYTES = 22 * 1024
 
 
 def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
@@ -341,6 +346,7 @@ async def collect_thread_proxies(
     total_timeout: float = DEFAULT_THREAD_TOTAL_TIMEOUT,
     request_timeout: float = DEFAULT_THREAD_REQUEST_TIMEOUT,
     max_messages: int = DEFAULT_THREAD_MAX_MESSAGES,
+    max_proxies: int = DEFAULT_SOURCE_MAX_PROXIES,
     max_age_days: int = DEFAULT_SOURCE_MAX_AGE_DAYS,
     event_sink: Any | None = None,
     cancel_event: threading.Event | None = None,
@@ -356,6 +362,7 @@ async def collect_thread_proxies(
     timed_out = False
     hit_limit = False
     hit_age_limit = False
+    hit_proxy_limit = False
 
     _emit_progress(
         event_sink,
@@ -378,8 +385,7 @@ async def collect_thread_proxies(
             "get_root_message",
         )
         if root_message is not None and not _message_is_older_than(root_message, cutoff_dt):
-            for proxy in _extract_message_proxies(root_message, source_url):
-                registry[proxy.key] = proxy
+            hit_proxy_limit = _register_proxies_from_message(registry, root_message, source_url, max_proxies=max_proxies)
 
         iterator = client.iter_messages(entity, reply_to=thread_id, limit=None)
         while True:
@@ -389,6 +395,9 @@ async def collect_thread_proxies(
                 break
             if scanned_messages >= max_messages:
                 hit_limit = True
+                break
+            if max_proxies > 0 and len(registry) >= max_proxies:
+                hit_proxy_limit = True
                 break
             try:
                 message = await _await_timeout(
@@ -402,8 +411,9 @@ async def collect_thread_proxies(
                 hit_age_limit = True
                 break
             scanned_messages += 1
-            for proxy in _extract_message_proxies(message, source_url):
-                registry[proxy.key] = proxy
+            if _register_proxies_from_message(registry, message, source_url, max_proxies=max_proxies):
+                hit_proxy_limit = True
+                break
             if log_sink is not None and scanned_messages % THREAD_PROGRESS_EVERY == 0:
                 log_sink(
                     f"[thread] scanned={scanned_messages} proxies={len(registry)} "
@@ -427,6 +437,8 @@ async def collect_thread_proxies(
                 suffix = f" partial_timeout_after={scanned_messages}"
             elif hit_limit:
                 suffix = f" partial_limit={max_messages}"
+            elif hit_proxy_limit:
+                suffix = f" proxy_limit={max_proxies}"
             elif hit_age_limit:
                 suffix = f" age_limit={max_age_days}d"
             log_sink(f"[thread] {thread_url} -> {len(registry)} proxies{suffix}")
@@ -440,6 +452,7 @@ async def collect_thread_proxies(
             proxy_count=len(registry),
             timed_out=timed_out,
             hit_limit=hit_limit,
+            hit_proxy_limit=hit_proxy_limit,
             hit_age_limit=hit_age_limit,
             max_age_days=max_age_days,
         )
@@ -458,6 +471,7 @@ async def collect_telegram_source_proxies(
     total_timeout: float = DEFAULT_THREAD_TOTAL_TIMEOUT,
     request_timeout: float = DEFAULT_THREAD_REQUEST_TIMEOUT,
     max_messages: int = DEFAULT_THREAD_MAX_MESSAGES,
+    max_proxies: int = DEFAULT_SOURCE_MAX_PROXIES,
     max_age_days: int = DEFAULT_SOURCE_MAX_AGE_DAYS,
     event_sink: Any | None = None,
     source_index: int = 1,
@@ -474,6 +488,7 @@ async def collect_telegram_source_proxies(
     timed_out = False
     hit_limit = False
     hit_age_limit = False
+    hit_proxy_limit = False
 
     _emit_progress(
         event_sink,
@@ -499,8 +514,12 @@ async def collect_telegram_source_proxies(
             )
             if root_message is not None and not _message_is_older_than(root_message, cutoff_dt):
                 scanned_messages += 1
-                for proxy in _extract_message_proxies(root_message, spec.normalized_url):
-                    registry[proxy.key] = proxy
+                hit_proxy_limit = _register_proxies_from_message(
+                    registry,
+                    root_message,
+                    spec.normalized_url,
+                    max_proxies=max_proxies,
+                )
 
             with contextlib.suppress(Exception):
                 iterator = client.iter_messages(entity, reply_to=spec.message_id, limit=None)
@@ -511,6 +530,9 @@ async def collect_telegram_source_proxies(
                         break
                     if scanned_messages >= max_messages:
                         hit_limit = True
+                        break
+                    if max_proxies > 0 and len(registry) >= max_proxies:
+                        hit_proxy_limit = True
                         break
                     try:
                         message = await _await_timeout(
@@ -524,8 +546,14 @@ async def collect_telegram_source_proxies(
                         hit_age_limit = True
                         break
                     scanned_messages += 1
-                    for proxy in _extract_message_proxies(message, spec.normalized_url):
-                        registry[proxy.key] = proxy
+                    if _register_proxies_from_message(
+                        registry,
+                        message,
+                        spec.normalized_url,
+                        max_proxies=max_proxies,
+                    ):
+                        hit_proxy_limit = True
+                        break
                     if log_sink is not None and scanned_messages % THREAD_PROGRESS_EVERY == 0:
                         log_sink(
                             f"[telegram] scanned={scanned_messages} proxies={len(registry)} "
@@ -552,6 +580,9 @@ async def collect_telegram_source_proxies(
                 if scanned_messages >= max_messages:
                     hit_limit = True
                     break
+                if max_proxies > 0 and len(registry) >= max_proxies:
+                    hit_proxy_limit = True
+                    break
                 try:
                     message = await _await_timeout(
                         iterator.__anext__(),
@@ -564,8 +595,14 @@ async def collect_telegram_source_proxies(
                     hit_age_limit = True
                     break
                 scanned_messages += 1
-                for proxy in _extract_message_proxies(message, spec.normalized_url):
-                    registry[proxy.key] = proxy
+                if _register_proxies_from_message(
+                    registry,
+                    message,
+                    spec.normalized_url,
+                    max_proxies=max_proxies,
+                ):
+                    hit_proxy_limit = True
+                    break
                 if log_sink is not None and scanned_messages % THREAD_PROGRESS_EVERY == 0:
                     log_sink(
                         f"[telegram] scanned={scanned_messages} proxies={len(registry)} "
@@ -589,6 +626,8 @@ async def collect_telegram_source_proxies(
                 suffix = f" partial_timeout_after={scanned_messages}"
             elif hit_limit:
                 suffix = f" partial_limit={max_messages}"
+            elif hit_proxy_limit:
+                suffix = f" proxy_limit={max_proxies}"
             elif hit_age_limit:
                 suffix = f" age_limit={max_age_days}d"
             log_sink(f"[telegram] {spec.normalized_url} -> {len(registry)} proxies{suffix}")
@@ -602,6 +641,7 @@ async def collect_telegram_source_proxies(
             proxy_count=len(registry),
             timed_out=timed_out,
             hit_limit=hit_limit,
+            hit_proxy_limit=hit_proxy_limit,
             hit_age_limit=hit_age_limit,
             max_age_days=max_age_days,
         )
@@ -620,6 +660,7 @@ async def collect_telegram_sources_proxies(
     total_timeout: float = DEFAULT_THREAD_TOTAL_TIMEOUT,
     request_timeout: float = DEFAULT_THREAD_REQUEST_TIMEOUT,
     max_messages: int = DEFAULT_THREAD_MAX_MESSAGES,
+    max_proxies: int = DEFAULT_SOURCE_MAX_PROXIES,
     max_age_days: int = DEFAULT_SOURCE_MAX_AGE_DAYS,
     event_sink: Any | None = None,
     cancel_event: threading.Event | None = None,
@@ -651,6 +692,7 @@ async def collect_telegram_sources_proxies(
             total_timeout=total_timeout,
             request_timeout=request_timeout,
             max_messages=max_messages,
+            max_proxies=max_proxies,
             max_age_days=max_age_days,
             event_sink=event_sink,
             source_index=index,
@@ -690,7 +732,7 @@ async def deep_media_probe(
         results: list[tuple[str, float, int]] = []
         for username in sample_channels:
             entity = await _await_timeout(client.get_entity(username), _remaining(deadline, 8.0), "get_entity")
-            iterator = client.iter_messages(entity, limit=30)
+            iterator = client.iter_messages(entity, limit=40)
             while True:
                 if time.perf_counter() >= deadline:
                     raise RuntimeError("media_probe_timeout")
@@ -701,7 +743,19 @@ async def deep_media_probe(
                 media_kind = _detect_media_kind(message)
                 if media_kind is None:
                     continue
-                elapsed_ms, downloaded = await _download_sample_bytes(client, message, timeout=_remaining(deadline, 12.0))
+                elapsed_ms, downloaded, note = await _download_sample_bytes(
+                    client,
+                    message,
+                    max_bytes=192 * 1024,
+                    timeout=_remaining(deadline, 12.0),
+                )
+                if note == "dpi_16_20kb_suspected":
+                    return MediaProbeResult(
+                        proxy.key,
+                        0.0,
+                        f"{media_kind} dpi_16_20kb_suspected",
+                        round((time.perf_counter() - started_at) * 1000.0, 2),
+                    )
                 if downloaded > 0:
                     results.append((media_kind, elapsed_ms, downloaded))
                 break
@@ -731,7 +785,7 @@ async def deep_media_probe(
         return MediaProbeResult(
             proxy.key,
             None,
-            f"media_probe_failed:{type(exc).__name__}",
+            _probe_failure_note(exc, "media"),
             round((time.perf_counter() - started_at) * 1000.0, 2),
         )
     finally:
@@ -758,7 +812,7 @@ async def light_media_probe(
 
         for username in sample_channels:
             entity = await _await_timeout(client.get_entity(username), _remaining(deadline, 6.0), "get_entity")
-            iterator = client.iter_messages(entity, limit=15)
+            iterator = client.iter_messages(entity, limit=24)
             while True:
                 if time.perf_counter() >= deadline:
                     raise RuntimeError("light_media_probe_timeout")
@@ -769,12 +823,19 @@ async def light_media_probe(
                 media_kind = _detect_media_kind(message)
                 if media_kind is None:
                     continue
-                elapsed_ms, downloaded = await _download_sample_bytes(
+                elapsed_ms, downloaded, note = await _download_sample_bytes(
                     client,
                     message,
-                    max_bytes=96 * 1024,
+                    max_bytes=128 * 1024,
                     timeout=_remaining(deadline, 8.0),
                 )
+                if note == "dpi_16_20kb_suspected":
+                    return MediaProbeResult(
+                        proxy.key,
+                        0.0,
+                        f"{media_kind} dpi_16_20kb_suspected",
+                        round((time.perf_counter() - started_at) * 1000.0, 2),
+                    )
                 if downloaded <= 0:
                     continue
 
@@ -798,7 +859,7 @@ async def light_media_probe(
         return MediaProbeResult(
             proxy.key,
             None,
-            f"light_media_probe_failed:{type(exc).__name__}",
+            _probe_failure_note(exc, "light_media"),
             round((time.perf_counter() - started_at) * 1000.0, 2),
         )
     finally:
@@ -920,6 +981,20 @@ def _extract_message_proxies(message: Any, source_url: str) -> list[ProxyRecord]
     return list(records.values())
 
 
+def _register_proxies_from_message(
+    registry: dict[tuple[str, int, str], ProxyRecord],
+    message: Any,
+    source_url: str,
+    *,
+    max_proxies: int,
+) -> bool:
+    for proxy in _extract_message_proxies(message, source_url):
+        registry[proxy.key] = proxy
+        if max_proxies > 0 and len(registry) >= max_proxies:
+            return True
+    return False
+
+
 def _detect_media_kind(message: Any) -> str | None:
     if getattr(message, "photo", None) is not None:
         return "photo"
@@ -946,14 +1021,20 @@ async def _download_sample_bytes(
     message: Any,
     max_bytes: int = 256 * 1024,
     timeout: float = 12.0,
-) -> tuple[float, int]:
+) -> tuple[float, int, str]:
     started_at = time.perf_counter()
     downloaded = 0
     try:
         iterator = client.iter_download(message.media, request_size=64 * 1024)
-    except (TypeError, AttributeError, ValueError):
+    except (TypeError, AttributeError, ValueError, NotImplementedError, OSError):
         # media-тип не поддерживает скачивание (geo, contact, etc.)
-        return (time.perf_counter() - started_at) * 1000.0, 0
+        return await _download_sample_bytes_fallback(
+            client,
+            message,
+            max_bytes=max_bytes,
+            timeout=timeout,
+            started_at=started_at,
+        )
     deadline = time.perf_counter() + max(2.0, float(timeout))
     while True:
         if time.perf_counter() >= deadline:
@@ -962,11 +1043,58 @@ async def _download_sample_bytes(
             chunk = await _await_timeout(iterator.__anext__(), _remaining(deadline, 6.0), "iter_download")
         except StopAsyncIteration:
             break
+        except (TypeError, AttributeError, ValueError, NotImplementedError, OSError):
+            return await _download_sample_bytes_fallback(
+                client,
+                message,
+                max_bytes=max_bytes,
+                timeout=_remaining(deadline, 4.0),
+                started_at=started_at,
+            )
         downloaded += len(chunk)
         if downloaded >= max_bytes:
             break
     elapsed_ms = (time.perf_counter() - started_at) * 1000.0
-    return elapsed_ms, downloaded
+    if _looks_like_dpi_window_block(downloaded):
+        return elapsed_ms, downloaded, "dpi_16_20kb_suspected"
+    return elapsed_ms, downloaded, ""
+
+
+async def _download_sample_bytes_fallback(
+    client: TelegramClient,
+    message: Any,
+    *,
+    max_bytes: int,
+    timeout: float,
+    started_at: float,
+) -> tuple[float, int, str]:
+    payload = await _await_timeout(
+        client.download_media(message, file=bytes),
+        max(2.0, float(timeout)),
+        "download_media",
+    )
+    downloaded = len(payload or b"")
+    if downloaded > max_bytes:
+        downloaded = max_bytes
+    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+    if _looks_like_dpi_window_block(downloaded):
+        return elapsed_ms, downloaded, "dpi_16_20kb_suspected"
+    return elapsed_ms, downloaded, ""
+
+
+def _looks_like_dpi_window_block(downloaded: int) -> bool:
+    return DPI_WINDOW_MIN_BYTES <= int(downloaded or 0) <= DPI_WINDOW_MAX_BYTES
+
+
+def _probe_failure_note(exc: Exception, prefix: str) -> str:
+    text = str(exc or "").lower()
+    if isinstance(exc, OSError):
+        return f"{prefix}_probe_failed:network_error"
+    if isinstance(exc, (TypeError, AttributeError, ValueError, NotImplementedError)):
+        return f"{prefix}_probe_failed:unsupported_media"
+    if "timeout" in text:
+        return f"{prefix}_probe_failed:timeout"
+    return f"{prefix}_probe_failed:{type(exc).__name__}"
 
 
 async def _disconnect_quietly(client: TelegramClient) -> None:

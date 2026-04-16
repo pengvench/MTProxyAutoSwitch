@@ -75,6 +75,7 @@ APP_ICON_PATH = _asset_path("img", "icon.ico")
 ABOUT_VIDEO_PATH = _asset_path("img", "dancecardiscordrtc.mp4")
 AUTOSTART_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 AUTOSTART_VALUE = "MTProxyAutoSwitch"
+SINGLE_INSTANCE_MUTEX_NAME = "Global\\MTProxyAutoSwitch.Singleton"
 CLOSE_LABELS = {
     "ask": "Всегда спрашивать",
     "tray": "Скрывать в трей",
@@ -188,7 +189,7 @@ GENERAL_SETTING_TIPS = {
     ),
     "start_minimized": "При запуске окно не будет открываться поверх рабочего стола, приложение сразу уйдет в трей.",
     "auto_start_local": "Если уже есть рабочий пул, локальный proxy frontend стартует автоматически.",
-    "auto_update": "Только для public build. Приложение будет проверять GitHub Releases при запуске.",
+    "auto_update": "Приложение будет проверять GitHub Releases при запуске.",
     "telegram_sources": "Авторизованные Telegram-источники позволяют читать каналы, группы и ветки, включая случаи, где публичного web-view недостаточно.",
     "deep_media": "Дополнительно проверяет не только открытие чатов, но и загрузку фото, файлов, голосовых и других медиа через Telegram API.",
 }
@@ -472,6 +473,32 @@ class _PrimaryMonitorMessageBox:
 
 
 messagebox = _PrimaryMonitorMessageBox()
+
+
+def _acquire_single_instance():
+    if sys.platform != "win32" or not hasattr(ctypes, "windll"):
+        return object()
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.CreateMutexW(None, False, SINGLE_INSTANCE_MUTEX_NAME)
+    if not handle:
+        return object()
+    if kernel32.GetLastError() == 183:
+        with contextlib.suppress(Exception):
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                "MTProxy AutoSwitch уже запущен. Закройте существующий экземпляр или откройте окно из трея.",
+                APP_NAME,
+                0x30,
+            )
+        kernel32.CloseHandle(handle)
+        return None
+    return handle
+
+
+def _release_single_instance(handle) -> None:
+    if sys.platform == "win32" and hasattr(ctypes, "windll") and isinstance(handle, int):
+        with contextlib.suppress(Exception):
+            ctypes.windll.kernel32.CloseHandle(handle)
 
 
 _CLIPBOARD_CTRL_KEYSYMS = {
@@ -920,7 +947,7 @@ def _macos_app_bundle_path(target: Path | None = None) -> Path | None:
 
 
 def _macos_launch_agent_path() -> Path:
-    bundle_id = "com.mtproxyautoswitch.public" if is_public_release() else "com.mtproxyautoswitch"
+    bundle_id = "com.mtproxyautoswitch"
     return Path.home() / "Library" / "LaunchAgents" / f"{bundle_id}.plist"
 
 
@@ -1608,6 +1635,14 @@ class MTProxyAutoSwitchApp(ctk.CTk):
     def _auto_refresh_initial(self) -> None:
         if self._quitting or self.refresh_in_progress:
             return
+        working_count = int(self.snapshot_cache.get("working_count", 0) or 0)
+        if working_count > 0:
+            if not bool(self.snapshot_cache.get("local_running")) and self.runtime.config.auto_start_local:
+                with contextlib.suppress(Exception):
+                    self.runtime.start_local_server()
+                    self._refresh_snapshot()
+            self.after(15000, self.start_refresh)
+            return
         self.start_refresh()
 
     def _auto_check_updates(self) -> None:
@@ -1692,7 +1727,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         def worker() -> None:
             try:
                 result = prepare_windows_update(
-                    install_dir=self.runtime.root_dir,
+                    install_dir=self.runtime.install_dir,
                     state_dir=self.runtime.state_dir,
                     current_version=APP_PUBLIC_VERSION,
                     progress_sink=lambda message: ui_call(lambda message=message: self._set_update_status(message)),
@@ -2522,11 +2557,6 @@ class SettingsDialog(ctk.CTkToplevel):
             command=self.app.install_update,
         )
         self.install_update_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
-        if not is_public_release():
-            self.update_status_label.configure(text="Автообновление настроено для public build.")
-            self.check_updates_button.configure(state="disabled")
-            self.install_update_button.configure(state="disabled")
-
         ctk.CTkLabel(right, text="Локальный frontend", font=("Segoe UI Semibold", 16), text_color=COLOR_TEXT).pack(anchor="w", padx=18, pady=(16, 10))
         self._entry_row(right, "Host", self.local_host_var)
         self._entry_row(right, "Port", self.local_port_var)
@@ -4457,8 +4487,14 @@ def _trim_middle(value: str, max_len: int) -> str:
 
 
 def main() -> None:
-    app = MTProxyAutoSwitchApp()
-    app.mainloop()
+    single_instance_handle = _acquire_single_instance()
+    if single_instance_handle is None:
+        return
+    try:
+        app = MTProxyAutoSwitchApp()
+        app.mainloop()
+    finally:
+        _release_single_instance(single_instance_handle)
 
 
 if __name__ == "__main__":

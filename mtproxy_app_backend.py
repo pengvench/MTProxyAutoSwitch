@@ -5,6 +5,7 @@ import ctypes
 import json
 import os
 import secrets
+import shutil
 import sys
 import threading
 import time
@@ -29,6 +30,8 @@ from mtproxy_collector import (
 from mtproxy_local_proxy import DEFAULT_FAKE_TLS_DOMAIN, LocalMTProxyServer, ProxyPool
 from mtproxy_telegram import (
     DEFAULT_SOURCE_MAX_AGE_DAYS,
+    DEFAULT_SOURCE_MAX_PROXIES,
+    DEFAULT_SOURCE_MAX_MESSAGES,
     DEFAULT_TELEGRAM_SOURCE_URLS,
     TelegramAuthConfig,
     auth_is_configured,
@@ -77,7 +80,26 @@ def _macos_app_bundle_path(executable_path: Path) -> Path | None:
 
 
 def _runtime_app_dir_name() -> str:
-    return "MTProxyAutoSwitchPublic" if os.environ.get("MTPROXY_PUBLIC_RELEASE", "").strip().lower() in {"1", "true", "yes", "on"} else "MTProxyAutoSwitch"
+    return "MTProxyAutoSwitch"
+
+
+def persistent_state_root(install_dir: Path) -> Path:
+    if not getattr(sys, "frozen", False):
+        return install_dir
+    if sys.platform == "win32":
+        base = Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming"))
+        root = base / _runtime_app_dir_name()
+    elif sys.platform == "darwin":
+        root = Path.home() / "Library" / "Application Support" / _runtime_app_dir_name()
+    else:
+        base = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share"))
+        root = base / _runtime_app_dir_name()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+DEFAULT_MAX_PROXIES = 180
+DEFAULT_DEEP_MEDIA_TOP_N = 10
 
 
 @dataclass
@@ -93,7 +115,7 @@ class AppConfig:
     min_success_rate: float = 0.7
     max_high_latency_ratio: float = 0.6
     high_latency_streak: int = 3
-    max_proxies: int = 0
+    max_proxies: int = DEFAULT_MAX_PROXIES
     local_host: str = "127.0.0.1"
     local_port: int = 1443
     local_secret: str = field(default_factory=lambda: secrets.token_hex(16))
@@ -108,12 +130,14 @@ class AppConfig:
     thread_source_enabled: bool = False
     thread_source_url: str = "https://t.me/strbypass/237103"
     telegram_source_max_age_days: int = DEFAULT_SOURCE_MAX_AGE_DAYS
+    telegram_source_max_messages: int = DEFAULT_SOURCE_MAX_MESSAGES
+    telegram_source_max_proxies: int = DEFAULT_SOURCE_MAX_PROXIES
     live_probe_interval_sec: int = 20
     live_probe_duration_sec: float = 4.0
     live_probe_top_n: int = 12
     deep_media_enabled: bool = False
     rf_whitelist_check_enabled: bool = False
-    deep_media_top_n: int = 5
+    deep_media_top_n: int = DEFAULT_DEEP_MEDIA_TOP_N
     appearance: str = "auto"
     auto_update_enabled: bool = True
     telegram_api_id: int = 0
@@ -143,12 +167,13 @@ RECOMMENDED_WEB_SOURCE_ADDITIONS = [
 ]
 RECOMMENDED_TELEGRAM_SOURCE_ADDITIONS = [
     "https://t.me/telemtrs/16160",
+    "https://t.me/telemtfreeproxy",
     "https://t.me/ProxyFree_Ru",
 ]
 
 
 def is_public_release() -> bool:
-    return os.environ.get("MTPROXY_PUBLIC_RELEASE", "").strip().lower() in {"1", "true", "yes", "on"}
+    return True
 
 
 def _read_env_file(root_dir: Path) -> dict[str, str]:
@@ -175,11 +200,16 @@ class AppRuntime:
         log_sink: Any | None = None,
         event_sink: Any | None = None,
     ) -> None:
-        self.root_dir = runtime_root()
+        self.install_dir = runtime_root()
+        self.root_dir = persistent_state_root(self.install_dir)
+        self._migrate_legacy_state()
         self.state_dir = self.root_dir / DATA_DIR_NAME
         self.state_dir.mkdir(parents=True, exist_ok=True)
         _hide_windows_path(self.state_dir)
-        self.env_values = _read_env_file(self.root_dir)
+        self.env_values = {
+            **_read_env_file(self.install_dir),
+            **_read_env_file(self.root_dir),
+        }
         self.config_path = self.root_dir / CONFIG_FILE_NAME
         self.config = self._load_config()
         self.pool = ProxyPool()
@@ -242,13 +272,36 @@ class AppRuntime:
         payload = asdict(self.config)
         self.config_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    def _migrate_legacy_state(self) -> None:
+        if self.root_dir == self.install_dir:
+            return
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+        for name in (CONFIG_FILE_NAME, LIST_DIR_NAME, DATA_DIR_NAME, LEGACY_OUT_DIR_NAME, "app_state"):
+            source_path = self.install_dir / name
+            target_path = self.root_dir / name
+            if not source_path.exists() or target_path.exists():
+                continue
+            with contextlib.suppress(Exception):
+                if source_path.is_dir():
+                    shutil.copytree(source_path, target_path)
+                else:
+                    shutil.copy2(source_path, target_path)
+
     @staticmethod
     def _normalize_config(config: AppConfig) -> AppConfig:
         normalized = AppConfig(**asdict(config))
         normalized.local_fake_tls_enabled = False
         normalized.local_fake_tls_domain = ""
+        if int(normalized.max_proxies or 0) <= 0:
+            normalized.max_proxies = DEFAULT_MAX_PROXIES
         if int(normalized.telegram_source_max_age_days or 0) <= 0:
             normalized.telegram_source_max_age_days = DEFAULT_SOURCE_MAX_AGE_DAYS
+        if int(normalized.telegram_source_max_messages or 0) <= 0:
+            normalized.telegram_source_max_messages = DEFAULT_SOURCE_MAX_MESSAGES
+        if int(normalized.telegram_source_max_proxies or 0) <= 0:
+            normalized.telegram_source_max_proxies = DEFAULT_SOURCE_MAX_PROXIES
+        if int(normalized.deep_media_top_n or 0) <= 0:
+            normalized.deep_media_top_n = DEFAULT_DEEP_MEDIA_TOP_N
         return normalized
 
     @staticmethod
@@ -368,9 +421,10 @@ class AppRuntime:
                             upstream_proxy=best_upstream,
                             log_sink=self._log,
                             event_sink=self._emit,
-                            total_timeout=max(75.0, float(self.config.fetch_timeout) * 6.0),
+                            total_timeout=max(45.0, float(self.config.fetch_timeout) * 4.0),
                             request_timeout=max(8.0, float(self.config.fetch_timeout)),
-                            max_messages=max(1500, self.config.max_proxies or 8000),
+                            max_messages=int(self.config.telegram_source_max_messages or DEFAULT_SOURCE_MAX_MESSAGES),
+                            max_proxies=int(self.config.telegram_source_max_proxies or DEFAULT_SOURCE_MAX_PROXIES),
                             max_age_days=int(self.config.telegram_source_max_age_days or DEFAULT_SOURCE_MAX_AGE_DAYS),
                             cancel_event=cancel_event,
                         )
@@ -563,7 +617,7 @@ class AppRuntime:
             self._log(f"[media] skipped: telegram_session_not_authorized ({reason})")
             self._emit("telegram_auth_required", feature=reason)
             return working, rejected
-        candidate_limit = max(1, self.config.deep_media_top_n)
+        candidate_limit = max(1, int(self.config.deep_media_top_n or DEFAULT_DEEP_MEDIA_TOP_N))
         if strict:
             candidate_limit = max(candidate_limit, min(20, max(10, len(working))))
         top_candidates = working[:candidate_limit]
@@ -868,6 +922,13 @@ class AppRuntime:
             self._persistent_proxy_cache_path(),
             self.root_dir / LEGACY_OUT_DIR_NAME / LEGACY_WORKING_FILE_NAME,
         ]
+        if self.install_dir != self.root_dir:
+            paths.extend(
+                [
+                    self.install_dir / self.config.out_dir / LIST_FILE_NAME,
+                    self.install_dir / LEGACY_OUT_DIR_NAME / LEGACY_WORKING_FILE_NAME,
+                ]
+            )
         proxies: dict[tuple[str, int, str], ProxyRecord] = {}
         for path in paths:
             if not path.exists():
@@ -894,6 +955,13 @@ class AppRuntime:
             self._persistent_proxy_cache_path(),
             self.root_dir / LEGACY_OUT_DIR_NAME / LEGACY_WORKING_FILE_NAME,
         ]
+        if self.install_dir != self.root_dir:
+            candidates.extend(
+                [
+                    self.install_dir / self.config.out_dir / LIST_FILE_NAME,
+                    self.install_dir / LEGACY_OUT_DIR_NAME / LEGACY_WORKING_FILE_NAME,
+                ]
+            )
         merged: list[str] = []
         seen: set[str] = set()
         for path in candidates:
@@ -955,7 +1023,11 @@ class AppRuntime:
             (self.root_dir / LEGACY_OUT_DIR_NAME / LEGACY_WORKING_FILE_NAME, "legacy_working_list"),
             (self.root_dir / self.config.out_dir / REPORT_FILE_NAME, "cached_report"),
             (self.root_dir / LEGACY_OUT_DIR_NAME / LEGACY_REPORT_FILE_NAME, "legacy_cached_report"),
-            (self.root_dir / "mtproxy_seed.json", "bundled_seed"),
+            (self.install_dir / self.config.out_dir / LIST_FILE_NAME, "install_default_list"),
+            (self.install_dir / LEGACY_OUT_DIR_NAME / LEGACY_WORKING_FILE_NAME, "install_legacy_working_list"),
+            (self.install_dir / self.config.out_dir / REPORT_FILE_NAME, "install_cached_report"),
+            (self.install_dir / LEGACY_OUT_DIR_NAME / LEGACY_REPORT_FILE_NAME, "install_legacy_cached_report"),
+            (self.install_dir / "mtproxy_seed.json", "bundled_seed"),
         ]
 
         for report_path, source_name in report_candidates:
@@ -1078,10 +1150,18 @@ class AppRuntime:
             return None
 
     def _load_config(self) -> AppConfig:
-        legacy_path = self.root_dir / "app_state" / CONFIG_FILE_NAME
-        if not self.config_path.exists() and legacy_path.exists():
-            with contextlib.suppress(Exception):
-                self.config_path.write_text(legacy_path.read_text(encoding="utf-8"), encoding="utf-8")
+        legacy_paths = [
+            self.root_dir / "app_state" / CONFIG_FILE_NAME,
+            self.install_dir / CONFIG_FILE_NAME,
+            self.install_dir / "app_state" / CONFIG_FILE_NAME,
+        ]
+        if not self.config_path.exists():
+            for legacy_path in legacy_paths:
+                if not legacy_path.exists():
+                    continue
+                with contextlib.suppress(Exception):
+                    self.config_path.write_text(legacy_path.read_text(encoding="utf-8"), encoding="utf-8")
+                    break
         if not self.config_path.exists():
             config = AppConfig()
             self.config_path.write_text(json.dumps(asdict(config), ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1096,6 +1176,13 @@ class AppRuntime:
             normalized = True
         if data.get("appearance") not in {"auto", "light", "dark"}:
             data["appearance"] = "auto"
+            normalized = True
+        try:
+            max_proxies = int(data.get("max_proxies") or 0)
+        except (TypeError, ValueError):
+            max_proxies = 0
+        if "max_proxies" not in data or max_proxies <= 0:
+            data["max_proxies"] = DEFAULT_MAX_PROXIES
             normalized = True
         if data.get("telegram_session_file") in ("", "app_state/telegram_user", "app_state/telegram_user.session", None):
             data["telegram_session_file"] = f"{DATA_DIR_NAME}/telegram_user.sec"
@@ -1119,8 +1206,29 @@ class AppRuntime:
         if "telegram_source_max_age_days" not in data or source_max_age_days <= 0:
             data["telegram_source_max_age_days"] = DEFAULT_SOURCE_MAX_AGE_DAYS
             normalized = True
+        try:
+            source_max_messages = int(data.get("telegram_source_max_messages") or 0)
+        except (TypeError, ValueError):
+            source_max_messages = 0
+        if "telegram_source_max_messages" not in data or source_max_messages <= 0:
+            data["telegram_source_max_messages"] = DEFAULT_SOURCE_MAX_MESSAGES
+            normalized = True
+        try:
+            source_max_proxies = int(data.get("telegram_source_max_proxies") or 0)
+        except (TypeError, ValueError):
+            source_max_proxies = 0
+        if "telegram_source_max_proxies" not in data or source_max_proxies <= 0:
+            data["telegram_source_max_proxies"] = DEFAULT_SOURCE_MAX_PROXIES
+            normalized = True
         if "rf_whitelist_check_enabled" not in data:
             data["rf_whitelist_check_enabled"] = False
+            normalized = True
+        try:
+            deep_media_top_n = int(data.get("deep_media_top_n") or 0)
+        except (TypeError, ValueError):
+            deep_media_top_n = 0
+        if "deep_media_top_n" not in data or deep_media_top_n <= 0:
+            data["deep_media_top_n"] = DEFAULT_DEEP_MEDIA_TOP_N
             normalized = True
         if "auto_update_enabled" not in data:
             data["auto_update_enabled"] = True

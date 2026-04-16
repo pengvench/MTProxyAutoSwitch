@@ -24,7 +24,7 @@
 - Делать `deep media check` и строгую media-проверку для сложных сетей
 - Отправлять список рабочих прокси себе в `Избранное`
 - Экспортировать результаты в папку `list`
-- Проверять и устанавливать обновления public-версии
+- Проверять и устанавливать обновления приложения
 
 ## Что лежит в репозитории
 
@@ -33,9 +33,9 @@
 - `mtproxy_local_proxy.py` — локальный MTProto/Fake TLS frontend и pool upstream-прокси
 - `mtproxy_collector.py` — веб-парсинг и первичная проверка прокси
 - `mtproxy_telegram.py` — Telegram API, авторизация, Telegram-источники, media-check
-- `mtproxy_updater.py` — автообновление public-сборки
+- `mtproxy_updater.py` — автообновление приложения
 - `config.json` — текущий конфиг
-- `public_config.json` — шаблон конфига для public release
+- `config.template.json` — шаблон конфига для релизной сборки
 - `list/` — экспортированные списки и отчеты
 
 ## Как пользоваться
@@ -81,20 +81,7 @@
 
 ## Сборка Windows
 
-### Public release
-
-```bat
-build_release_public.bat
-```
-
-Результат:
-
-```text
-release-public\MTProxyAutoSwitchPublic\MTProxyAutoSwitchPublic.exe
-release-public\MTProxyAutoSwitchPublic.zip
-```
-
-### Private/local release
+### Release
 
 ```bat
 build_release.bat
@@ -103,19 +90,13 @@ build_release.bat
 Результат:
 
 ```text
-release\MTProxyAutoSwitch\MTProxyAutoSwitch.exe
+release-public\MTProxyAutoSwitch\MTProxyAutoSwitch.exe
+release-public\MTProxyAutoSwitch.zip
 ```
 
 ## Сборка macOS
 
-### Public release
-
-```bash
-chmod +x build_release_public_macos.sh
-./build_release_public_macos.sh
-```
-
-### Private/local release
+### Release
 
 ```bash
 chmod +x build_release_macos.sh

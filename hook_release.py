@@ -1,10 +1,6 @@
-# PyInstaller runtime hook: patch imageio_ffmpeg to find bundled ffmpeg
-# and ensure MTPROXY_PUBLIC_RELEASE is set.
-import os
+# PyInstaller runtime hook: patch imageio_ffmpeg to find bundled ffmpeg.
 import sys
 import pathlib
-
-os.environ.setdefault("MTPROXY_PUBLIC_RELEASE", "1")
 
 if getattr(sys, "frozen", False):
     _meipass = pathlib.Path(sys._MEIPASS)

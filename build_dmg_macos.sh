@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# build_dmg_macos.sh — упаковка MTProxyAutoSwitchPublic.app в .dmg
-# Запускать после build_release_public_macos.sh
+# build_dmg_macos.sh — упаковка MTProxyAutoSwitch.app в .dmg
+# Запускать после build_release_macos.sh
 set -euo pipefail
 cd "$(dirname "$0")"
 
-APP_NAME="MTProxyAutoSwitchPublic"
+APP_NAME="MTProxyAutoSwitch"
 DMG_NAME="${APP_NAME}.dmg"
 APP_BUNDLE="release-macos/${APP_NAME}/${APP_NAME}.app"
 STAGING_DIR="release-macos/dmg_staging"
@@ -13,7 +13,7 @@ VOLUME_NAME="MTProxy AutoSwitch"
 
 if [ ! -d "${APP_BUNDLE}" ]; then
     echo "❌  App bundle not found: ${APP_BUNDLE}"
-    echo "    Сначала запустите: ./build_release_public_macos.sh"
+    echo "    Сначала запустите: ./build_release_macos.sh"
     exit 1
 fi
 
@@ -29,7 +29,7 @@ ln -s /Applications "${STAGING_DIR}/Applications"
 
 # Дополнительные файлы рядом с .app
 cp README.md        "${STAGING_DIR}/README.txt"        2>/dev/null || true
-cp public_config.json "${STAGING_DIR}/config.json"    2>/dev/null || true
+cp config.template.json "${STAGING_DIR}/config.json"    2>/dev/null || true
 cp mtproxy_seed.json  "${STAGING_DIR}/mtproxy_seed.json" 2>/dev/null || true
 mkdir -p "${STAGING_DIR}/list"
 cp list/proxy_list.txt "${STAGING_DIR}/list/" 2>/dev/null || true

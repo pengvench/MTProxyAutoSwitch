@@ -1,10 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
-import os
 import platform
 import tempfile
 import pathlib
-
-os.environ['MTPROXY_PUBLIC_RELEASE'] = '1'
 
 from PyInstaller.utils.hooks import collect_all
 
@@ -28,7 +25,6 @@ target_arch = _resolve_target_arch()
 
 _hook_code = (
     "import os, sys, pathlib\n"
-    "os.environ.setdefault('MTPROXY_PUBLIC_RELEASE', '1')\n"
     "if getattr(sys, 'frozen', False):\n"
     "    _d = pathlib.Path(sys._MEIPASS)\n"
     "    for _p in ('imageio_ffmpeg/binaries/ffmpeg*.exe',\n"
@@ -89,7 +85,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='MTProxyAutoSwitchPublic',
+    name='MTProxyAutoSwitch',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -110,22 +106,22 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='MTProxyAutoSwitchPublic',
+    name='MTProxyAutoSwitch',
 )
 
 app = BUNDLE(
     coll,
-    name='MTProxyAutoSwitchPublic.app',
+    name='MTProxyAutoSwitch.app',
     icon=None,
-    bundle_identifier='com.mtproxyautoswitch.public',
+    bundle_identifier='com.mtproxyautoswitch',
     info_plist={
-        'CFBundleName': 'MTProxy AutoSwitch Public',
-        'CFBundleDisplayName': 'MTProxy AutoSwitch Public',
+        'CFBundleName': 'MTProxy AutoSwitch',
+        'CFBundleDisplayName': 'MTProxy AutoSwitch',
         'CFBundleShortVersionString': '1.0.0',
         'CFBundleVersion': '1.0.0',
         'LSMinimumSystemVersion': '10.15',
         'NSHighResolutionCapable': True,
         'NSAppleEventsUsageDescription':
-            'MTProxy AutoSwitch Public may open Telegram proxy links in the Telegram app.',
+            'MTProxy AutoSwitch may open Telegram proxy links in the Telegram app.',
     },
 )
