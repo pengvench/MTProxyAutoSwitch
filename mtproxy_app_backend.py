@@ -27,12 +27,13 @@ from mtproxy_collector import (
     run_collection,
     run_async,
 )
-from mtproxy_local_proxy import DEFAULT_FAKE_TLS_DOMAIN, LocalMTProxyServer, ProxyPool
+from mtproxy_local_proxy import LocalMTProxyServer, ProxyPool
 from mtproxy_telegram import (
     DEFAULT_SOURCE_MAX_AGE_DAYS,
     DEFAULT_SOURCE_MAX_PROXIES,
     DEFAULT_SOURCE_MAX_MESSAGES,
     DEFAULT_TELEGRAM_SOURCE_URLS,
+    MediaProbeResult,
     TelegramAuthConfig,
     auth_is_configured,
     collect_telegram_sources_proxies,
@@ -83,6 +84,29 @@ def _runtime_app_dir_name() -> str:
     return "MTProxyAutoSwitch"
 
 
+def bundled_resource_roots() -> list[Path]:
+    roots: list[Path] = []
+    if getattr(sys, "frozen", False):
+        executable_path = Path(sys.executable).resolve()
+        roots.append(Path(getattr(sys, "_MEIPASS", executable_path.parent)))
+        roots.append(executable_path.parent)
+        if sys.platform == "darwin":
+            app_bundle = _macos_app_bundle_path(executable_path)
+            if app_bundle is not None:
+                roots.append(app_bundle.parent)
+                roots.append(app_bundle / "Contents" / "Resources")
+    roots.append(Path(__file__).resolve().parent)
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        marker = str(root.resolve())
+        if marker in seen:
+            continue
+        seen.add(marker)
+        unique.append(root)
+    return unique
+
+
 def persistent_state_root(install_dir: Path) -> Path:
     if not getattr(sys, "frozen", False):
         return install_dir
@@ -119,8 +143,6 @@ class AppConfig:
     local_host: str = "127.0.0.1"
     local_port: int = 1443
     local_secret: str = field(default_factory=lambda: secrets.token_hex(16))
-    local_fake_tls_enabled: bool = False
-    local_fake_tls_domain: str = ""
     auto_start_local: bool = True
     autostart_enabled: bool = False
     start_minimized_to_tray: bool = False
@@ -170,6 +192,7 @@ RECOMMENDED_TELEGRAM_SOURCE_ADDITIONS = [
     "https://t.me/telemtfreeproxy",
     "https://t.me/ProxyFree_Ru",
 ]
+SAVED_MESSAGES_EXPORT_LIMIT = 20
 
 
 def is_public_release() -> bool:
@@ -220,8 +243,6 @@ class AppRuntime:
             host=self.config.local_host,
             port=self.config.local_port,
             secret=self.config.local_secret,
-            fake_tls_enabled=False,
-            fake_tls_domain="",
             log_sink=self._log,
             event_sink=self._emit,
         )
@@ -236,13 +257,17 @@ class AppRuntime:
         self.seed_loaded_at: float = 0.0
         self.thread_status: str = "not_checked"
         self.thread_proxy_count: int = 0
-        self._latest_deep_media_scores: dict[tuple[str, int, str], tuple[float | None, str]] = {}
+        self._latest_deep_media_scores: dict[tuple[str, int, str], MediaProbeResult] = {}
         self.telegram_lock = threading.RLock()
         self._load_initial_pool()
         self.live_probe_stop = threading.Event()
         self._last_focused_probe_at: float = 0.0
         self._last_broad_probe_at: float = 0.0
         self._last_media_pulse_at: float = 0.0
+        self._last_media_activity_at: float = 0.0
+        self._last_heavy_upload_at: float = 0.0
+        self._last_media_accel_probe_at: float = 0.0
+        self._health_cycle_lock = threading.Lock()
         self.live_probe_thread = threading.Thread(target=self._live_probe_loop, daemon=True, name="mtproxy-live-probe")
         self.live_probe_thread.start()
         self._auth_code_hash: str = ""
@@ -290,8 +315,6 @@ class AppRuntime:
     @staticmethod
     def _normalize_config(config: AppConfig) -> AppConfig:
         normalized = AppConfig(**asdict(config))
-        normalized.local_fake_tls_enabled = False
-        normalized.local_fake_tls_domain = ""
         if int(normalized.max_proxies or 0) <= 0:
             normalized.max_proxies = DEFAULT_MAX_PROXIES
         if int(normalized.telegram_source_max_age_days or 0) <= 0:
@@ -310,8 +333,6 @@ class AppRuntime:
             config.local_host,
             int(config.local_port),
             config.local_secret,
-            bool(config.local_fake_tls_enabled),
-            config.local_fake_tls_domain,
         )
 
     def apply_config(self, config: AppConfig) -> bool:
@@ -333,8 +354,6 @@ class AppRuntime:
                 host=self.config.local_host,
                 port=self.config.local_port,
                 secret=self.config.local_secret,
-                fake_tls_enabled=False,
-                fake_tls_domain="",
                 log_sink=self._log,
                 event_sink=self._emit,
             )
@@ -350,6 +369,38 @@ class AppRuntime:
 
     def stop_local_server(self) -> None:
         self.local_server.stop()
+
+    def _active_media_transfer_pressure(self) -> dict[str, int]:
+        pressure = self.pool.media_pressure()
+        return {
+            "active_media": int(pressure.get("active_media", 0)),
+            "active_heavy": int(pressure.get("active_heavy", 0)),
+            "recent_media": int(pressure.get("recent_media", 0)),
+        }
+
+    def _wait_for_media_idle(
+        self,
+        *,
+        reason: str,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
+        waiting_announced = False
+        while self.local_server.is_running():
+            pressure = self._active_media_transfer_pressure()
+            if pressure["active_media"] <= 0 and pressure["active_heavy"] <= 0:
+                if waiting_announced:
+                    self._emit("runtime_refresh_resumed", reason=reason)
+                return
+            if cancel_event is not None and cancel_event.is_set():
+                raise RuntimeError("refresh_cancelled")
+            if not waiting_announced:
+                self._log(
+                    f"[runtime] waiting for media session to finish before {reason} "
+                    f"(active_media={pressure['active_media']} active_heavy={pressure['active_heavy']})"
+                )
+                self._emit("runtime_refresh_waiting", reason=reason, **pressure)
+                waiting_announced = True
+            time.sleep(0.5)
 
     @staticmethod
     def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
@@ -379,6 +430,7 @@ class AppRuntime:
             verbose=True,
         )
 
+        self._wait_for_media_idle(reason="refresh", cancel_event=cancel_event)
         self._log("[runtime] refreshing proxy pool")
         base_result = run_collection(
             config,
@@ -394,6 +446,7 @@ class AppRuntime:
 
         manual_proxies = [item for item in self._load_manual_list_proxies() if item.key not in known_keys]
         if manual_proxies:
+            self._wait_for_media_idle(reason="manual_list_probe", cancel_event=cancel_event)
             self._log(f"[manual-list] probing {len(manual_proxies)} proxies from existing list")
             manual_outcomes = run_async(
                 probe_all(
@@ -413,6 +466,7 @@ class AppRuntime:
         telegram_sources = self._collect_enabled_telegram_sources()
         if telegram_sources and best_upstream is not None:
             try:
+                self._wait_for_media_idle(reason="telegram_sources", cancel_event=cancel_event)
                 with self.telegram_lock:
                     thread_proxies = run_async(
                         collect_telegram_sources_proxies(
@@ -433,6 +487,7 @@ class AppRuntime:
                 self.thread_status = f"loaded:{len(thread_proxies)}"
                 new_proxies = [item for item in thread_proxies if item.key not in known_keys]
                 if new_proxies:
+                    self._wait_for_media_idle(reason="telegram_probe", cancel_event=cancel_event)
                     self._log(f"[telegram] probing {len(new_proxies)} new proxies from Telegram sources")
                     self._emit("telegram_sources_probing_started", total_proxies=len(new_proxies))
                     extra_outcomes = run_async(
@@ -466,6 +521,7 @@ class AppRuntime:
         )
 
         if (self.config.deep_media_enabled or self.config.rf_whitelist_check_enabled) and combined_working:
+            self._wait_for_media_idle(reason="deep_media", cancel_event=cancel_event)
             combined_working, combined_rejected = self._run_deep_media_checks(
                 combined_working,
                 combined_rejected,
@@ -477,6 +533,7 @@ class AppRuntime:
         self.last_outcomes = combined_outcomes
         self.last_working = combined_working
         self.last_rejected = combined_rejected
+        self._wait_for_media_idle(reason="apply_results", cancel_event=cancel_event)
         self.pool.replace_outcomes(combined_working)
         self._apply_latest_deep_media_scores()
 
@@ -508,7 +565,11 @@ class AppRuntime:
                 "session_exists": session_path.exists(),
             }
         with self.telegram_lock:
-            return run_async(get_auth_status(cfg, upstream_proxy=self._best_proxy()))
+            try:
+                return run_async(get_auth_status(cfg, upstream_proxy=None))
+            except Exception as exc:
+                self._log(f"[auth] direct auth-status failed, retrying via proxy: {exc}")
+                return run_async(get_auth_status(cfg, upstream_proxy=self._best_proxy()))
 
     def request_auth_code(self, phone: str) -> dict[str, Any]:
         with self.telegram_lock:
@@ -556,7 +617,7 @@ class AppRuntime:
             )
 
     def send_working_proxies_to_saved_messages(self) -> dict[str, Any]:
-        urls = [item.proxy.url for item in self.last_working]
+        urls = [item.proxy.url for item in self.last_working[:SAVED_MESSAGES_EXPORT_LIMIT]]
         with self.telegram_lock:
             return run_async(
                 send_proxy_list_to_saved_messages(
@@ -577,8 +638,6 @@ class AppRuntime:
             "local_running": self.local_server.is_running(),
             "local_url": self.local_server.local_proxy_url,
             "local_tg_url": self.local_server.local_proxy_tg_url,
-            "local_fake_tls_enabled": self.local_server.fake_tls_enabled,
-            "local_fake_tls_domain": self.local_server.fake_tls_domain,
             "best_proxy": current_best.proxy.url if current_best is not None else "",
             "last_refresh_started_at": self.last_refresh_started_at,
             "last_refresh_finished_at": self.last_refresh_finished_at,
@@ -611,7 +670,11 @@ class AppRuntime:
     ) -> tuple[list[ProbeOutcome], list[ProbeOutcome]]:
         working = sorted(working, key=self._working_priority_key)
         with self.telegram_lock:
-            auth_status = run_async(get_auth_status(self.auth_config, upstream_proxy=self._best_proxy()))
+            try:
+                auth_status = run_async(get_auth_status(self.auth_config, upstream_proxy=self._best_proxy()))
+            except Exception as exc:
+                self._log(f"[media] auth-status via proxy failed, retrying direct: {exc}")
+                auth_status = run_async(get_auth_status(self.auth_config, upstream_proxy=None))
         if not auth_status.get("authorized"):
             reason = "rf_whitelist" if strict else "deep_media"
             self._log(f"[media] skipped: telegram_session_not_authorized ({reason})")
@@ -632,8 +695,15 @@ class AppRuntime:
             self._raise_if_cancelled(cancel_event)
             with self.telegram_lock:
                 result = run_async(deep_media_probe(outcome.proxy, self.auth_config))
-            self._latest_deep_media_scores[result.proxy_key] = (result.score, result.note)
-            self.pool.update_deep_media_score(result.proxy_key, result.score, result.note)
+            self._latest_deep_media_scores[result.proxy_key] = result
+            self.pool.update_deep_media_score(
+                result.proxy_key,
+                result.score,
+                result.note,
+                upload_kbps=result.upload_kbps,
+                download_kbps=result.download_kbps,
+                aux_kbps=result.aux_kbps,
+            )
             self._log(f"[media] {outcome.proxy.host}:{outcome.proxy.port} -> {result.note}")
             self._emit(
                 "deep_media_progress",
@@ -699,26 +769,52 @@ class AppRuntime:
                 self._log(f"[live] probe loop error: {exc}")
 
     def _run_background_health_cycle(self) -> None:
-        now = time.time()
-        focused_interval = 35.0 if self.local_server.is_running() else 75.0
-        broad_interval = max(150.0, float(self.config.live_probe_interval_sec) * 6.0)
-        media_interval = 900.0
+        if not self._health_cycle_lock.acquire(blocking=False):
+            return
+        try:
+            pressure = self._active_media_transfer_pressure()
+            if pressure["active_media"] > 0 or pressure["active_heavy"] > 0:
+                return
+            now = time.time()
+            prefer_media = (
+                pressure["active_media"] > 0
+                or pressure["active_heavy"] > 0
+                or (now - self._last_media_activity_at) <= 60.0
+            )
+            focused_interval = 35.0 if self.local_server.is_running() else 75.0
+            if prefer_media and self.local_server.is_running():
+                focused_interval = 24.0
+            if pressure["active_heavy"] > 0:
+                focused_interval = 12.0
+            broad_interval = max(150.0, float(self.config.live_probe_interval_sec) * 6.0)
+            media_interval = 900.0
+            if prefer_media:
+                media_interval = 180.0
+            if pressure["active_heavy"] > 0:
+                media_interval = 60.0
 
-        if (now - self._last_focused_probe_at) >= focused_interval:
-            self._run_live_probe_once(focused=True)
-            self._last_focused_probe_at = now
+            if (now - self._last_focused_probe_at) >= focused_interval:
+                self._run_live_probe_once(focused=True, prefer_media=prefer_media)
+                self._last_focused_probe_at = now
 
-        if (now - self._last_broad_probe_at) >= broad_interval:
-            self._run_live_probe_once(focused=False)
-            self._last_broad_probe_at = now
+            if (now - self._last_broad_probe_at) >= broad_interval:
+                self._run_live_probe_once(
+                    focused=False,
+                    prefer_media=prefer_media and pressure["recent_media"] > 0,
+                )
+                self._last_broad_probe_at = now
 
-        if (now - self._last_media_pulse_at) >= media_interval:
-            self._run_background_media_pulse()
-            self._last_media_pulse_at = now
+            if (now - self._last_media_pulse_at) >= media_interval:
+                self._run_background_media_pulse(limit=3 if prefer_media else 1, prefer_media=prefer_media)
+                self._last_media_pulse_at = now
+        finally:
+            self._health_cycle_lock.release()
 
-    def _run_live_probe_once(self, *, focused: bool) -> None:
+    def _run_live_probe_once(self, *, focused: bool, prefer_media: bool = False) -> None:
         if focused:
-            candidates = self.pool.select_monitor_targets(limit=2)
+            candidates = self.pool.select_monitor_targets(limit=3 if prefer_media else 2, prefer_media=prefer_media)
+        elif prefer_media:
+            candidates = self.pool.select_turbo_media_candidates(limit=max(2, min(5, self.config.live_probe_top_n)))
         else:
             candidates = self.pool.select_candidates(is_media=False, limit=max(1, min(4, self.config.live_probe_top_n)))
         if not candidates:
@@ -738,7 +834,7 @@ class AppRuntime:
             probe_all(
                 proxies=[item.proxy for item in candidates],
                 settings=settings,
-                concurrency=max(1, min(2 if focused else 4, len(candidates))),
+                concurrency=max(1, min((3 if focused and prefer_media else 2 if focused else 4), len(candidates))),
                 verbose=False,
                 log_sink=self._log,
                 event_sink=None,
@@ -752,8 +848,8 @@ class AppRuntime:
                 ok,
                 outcome.reason,
                 max_latency_ms=float(self.config.max_latency_ms or 300.0),
-                high_latency_streak_limit=2 if focused else 3,
-                failure_limit=2 if focused else 3,
+                high_latency_streak_limit=1 if prefer_media and focused else 2 if focused else 3,
+                failure_limit=1 if prefer_media and focused else 2 if focused else 3,
                 cooldown_seconds=180.0 if focused else 120.0,
             )
             if cooldown_reason:
@@ -764,51 +860,102 @@ class AppRuntime:
                     port=outcome.proxy.port,
                     reason=cooldown_reason,
                 )
-        self._emit("live_probe_updated", count=len(outcomes), focused=focused)
+        self._emit("live_probe_updated", count=len(outcomes), focused=focused, prefer_media=prefer_media)
 
-    def _run_background_media_pulse(self) -> None:
+    def _run_background_media_pulse(self, *, limit: int = 1, prefer_media: bool = False) -> None:
         if not self.local_server.is_running():
             return
         if not self.auth_config.api_id or not self.auth_config.api_hash.strip():
             return
-        candidates = self.pool.select_monitor_targets(limit=1)
+        candidates = self.pool.select_monitor_targets(limit=max(1, limit), prefer_media=prefer_media)
         if not candidates:
             return
-        target = candidates[0]
-        try:
-            with self.telegram_lock:
-                result = run_async(light_media_probe(target.proxy, self.auth_config))
-        except Exception as exc:
-            self._log(f"[media-bg] probe error for {target.proxy.host}:{target.proxy.port} -> {exc}")
-            return
+        for target in candidates:
+            try:
+                with self.telegram_lock:
+                    result = run_async(light_media_probe(target.proxy, self.auth_config))
+            except Exception as exc:
+                self._log(f"[media-bg] probe error for {target.proxy.host}:{target.proxy.port} -> {exc}")
+                continue
 
-        if result.note == "session_not_authorized":
-            self._emit("telegram_auth_required", feature="background_media")
-            self._log("[media-bg] skipped: telegram_session_not_authorized")
-            return
-        if result.note == "no_media_samples_found":
-            self.pool.update_deep_media_score(result.proxy_key, result.score, result.note)
-            self._log(f"[media-bg] {target.proxy.host}:{target.proxy.port} -> {result.note}")
-            return
+            if result.note == "session_not_authorized":
+                self._emit("telegram_auth_required", feature="background_media")
+                self._log("[media-bg] skipped: telegram_session_not_authorized")
+                return
+            if result.note in {"no_media_samples_found", "no_video_samples_found"}:
+                self.pool.update_deep_media_score(
+                    result.proxy_key,
+                    result.score,
+                    result.note,
+                    upload_kbps=result.upload_kbps,
+                    download_kbps=result.download_kbps,
+                    aux_kbps=result.aux_kbps,
+                )
+                self._log(f"[media-bg] {target.proxy.host}:{target.proxy.port} -> {result.note}")
+                continue
 
-        cooldown_reason = self.pool.update_background_media_probe(
-            result.proxy_key,
-            result.score,
-            result.note,
-            failure_score=0.6,
-            cooldown_seconds=300.0,
-        )
-        self._log(
-            f"[media-bg] {target.proxy.host}:{target.proxy.port} -> "
-            f"{result.note} score={result.score if result.score is not None else 'n/a'}"
-        )
-        if cooldown_reason:
-            self._emit(
-                "proxy_cooldown",
-                host=target.proxy.host,
-                port=target.proxy.port,
-                reason=cooldown_reason,
+            cooldown_reason = self.pool.update_background_media_probe(
+                result.proxy_key,
+                result.score,
+                result.note,
+                upload_kbps=result.upload_kbps,
+                download_kbps=result.download_kbps,
+                aux_kbps=result.aux_kbps,
+                failure_score=0.7 if prefer_media else 0.6,
+                cooldown_seconds=360.0 if prefer_media else 300.0,
             )
+            self._log(
+                f"[media-bg] {target.proxy.host}:{target.proxy.port} -> "
+                f"{result.note} score={result.score if result.score is not None else 'n/a'}"
+            )
+            if cooldown_reason:
+                self._emit(
+                    "proxy_cooldown",
+                    host=target.proxy.host,
+                    port=target.proxy.port,
+                    reason=cooldown_reason,
+                )
+
+    def _schedule_media_acceleration_probe(self, payload: dict[str, Any]) -> None:
+        now = time.time()
+        if (now - self._last_media_accel_probe_at) < 12.0:
+            return
+        self._last_media_accel_probe_at = now
+
+        def _runner() -> None:
+            if not self._health_cycle_lock.acquire(blocking=False):
+                return
+            try:
+                host = str(payload.get("host") or "")
+                port = payload.get("port")
+                upload_kbps = payload.get("upload_kbps")
+                label = f"{host}:{port}" if host and port else "media session"
+                self._log(f"[media-boost] heavy upload detected on {label}, reprobe turbo shortlist ({upload_kbps} KB/s)")
+                self._run_live_probe_once(focused=True, prefer_media=True)
+                self._run_background_media_pulse(limit=3, prefer_media=True)
+                stamp = time.time()
+                self._last_focused_probe_at = stamp
+                self._last_media_pulse_at = stamp
+            finally:
+                self._health_cycle_lock.release()
+
+        threading.Thread(target=_runner, daemon=True, name="mtproxy-media-boost").start()
+
+    def _handle_internal_event(self, event_name: str, payload: dict[str, Any]) -> None:
+        now = time.time()
+        if event_name == "local_upstream_selected" and bool(payload.get("is_media")):
+            self._last_media_activity_at = now
+            return
+        if event_name == "local_media_activity":
+            self._last_media_activity_at = now
+            if bool(payload.get("heavy_upload")):
+                self._last_heavy_upload_at = now
+                self._schedule_media_acceleration_probe(payload)
+            return
+        if event_name == "local_session_closed" and (bool(payload.get("is_media")) or bool(payload.get("heavy_upload"))):
+            self._last_media_activity_at = now
+            if bool(payload.get("heavy_upload")):
+                self._last_heavy_upload_at = now
 
     def _export_combined_results(
         self,
@@ -884,8 +1031,15 @@ class AppRuntime:
         return rows
 
     def _apply_latest_deep_media_scores(self) -> None:
-        for proxy_key, (score, note) in self._latest_deep_media_scores.items():
-            self.pool.update_deep_media_score(proxy_key, score, note)
+        for proxy_key, result in self._latest_deep_media_scores.items():
+            self.pool.update_deep_media_score(
+                proxy_key,
+                result.score,
+                result.note,
+                upload_kbps=result.upload_kbps,
+                download_kbps=result.download_kbps,
+                aux_kbps=result.aux_kbps,
+            )
 
     def _best_proxy(self):
         best = self.pool.best()
@@ -911,10 +1065,6 @@ class AppRuntime:
             if legacy_url:
                 merged.append(legacy_url)
         return merged
-
-    @staticmethod
-    def _effective_fake_tls_domain(enabled: bool, domain: str) -> str:
-        return ""
 
     def _load_manual_list_proxies(self) -> list[ProxyRecord]:
         paths = [
@@ -1027,8 +1177,9 @@ class AppRuntime:
             (self.install_dir / LEGACY_OUT_DIR_NAME / LEGACY_WORKING_FILE_NAME, "install_legacy_working_list"),
             (self.install_dir / self.config.out_dir / REPORT_FILE_NAME, "install_cached_report"),
             (self.install_dir / LEGACY_OUT_DIR_NAME / LEGACY_REPORT_FILE_NAME, "install_legacy_cached_report"),
-            (self.install_dir / "mtproxy_seed.json", "bundled_seed"),
         ]
+        for bundle_root in bundled_resource_roots():
+            report_candidates.append((bundle_root / "mtproxy_seed.json", "bundled_seed"))
 
         for report_path, source_name in report_candidates:
             outcomes = self._load_seed_outcomes(report_path, source_name=source_name)
@@ -1187,17 +1338,11 @@ class AppRuntime:
         if data.get("telegram_session_file") in ("", "app_state/telegram_user", "app_state/telegram_user.session", None):
             data["telegram_session_file"] = f"{DATA_DIR_NAME}/telegram_user.sec"
             normalized = True
-        if "local_fake_tls_enabled" not in data:
-            data["local_fake_tls_enabled"] = False
+        if "local_fake_tls_enabled" in data:
+            data.pop("local_fake_tls_enabled", None)
             normalized = True
-        elif data.get("local_fake_tls_enabled"):
-            data["local_fake_tls_enabled"] = False
-            normalized = True
-        if "local_fake_tls_domain" not in data:
-            data["local_fake_tls_domain"] = ""
-            normalized = True
-        elif data.get("local_fake_tls_domain"):
-            data["local_fake_tls_domain"] = ""
+        if "local_fake_tls_domain" in data:
+            data.pop("local_fake_tls_domain", None)
             normalized = True
         try:
             source_max_age_days = int(data.get("telegram_source_max_age_days") or 0)
@@ -1271,15 +1416,25 @@ class AppRuntime:
         latency = outcome.avg_latency_ms if outcome.avg_latency_ms is not None else 9_999.0
         pool_row = self.pool.snapshot_by_key(outcome.proxy.key)
         latest_media = self._latest_deep_media_scores.get(outcome.proxy.key)
-        media_score = latest_media[0] if latest_media is not None else None
+        media_score = latest_media.score if latest_media is not None else None
+        deep_download_kbps = latest_media.download_kbps if latest_media is not None else None
+        deep_upload_kbps = latest_media.upload_kbps if latest_media is not None else None
         if media_score is None and pool_row:
             media_score = pool_row.get("deep_media_score")
+        if deep_download_kbps is None and pool_row:
+            deep_download_kbps = pool_row.get("deep_media_download_kbps")
+        if deep_upload_kbps is None and pool_row:
+            deep_upload_kbps = pool_row.get("deep_media_upload_kbps")
         if media_score is None and pool_row:
             fallback_media = pool_row.get("media_score")
             if fallback_media is not None and float(fallback_media) >= 0.0:
                 media_score = float(fallback_media)
         media_penalty = -float(media_score) if media_score is not None else 0.0
+        deep_download_penalty = -float(deep_download_kbps) if deep_download_kbps is not None else 0.0
+        deep_upload_penalty = -float(deep_upload_kbps) if deep_upload_kbps is not None else 0.0
         return (
+            deep_download_penalty,
+            deep_upload_penalty,
             media_penalty,
             latency,
             -outcome.success_rate,
@@ -1292,9 +1447,10 @@ class AppRuntime:
             self.log_sink(message)
 
     def _emit(self, event_name: str, payload: dict[str, Any] | None = None, **kwargs: Any) -> None:
+        merged = dict(payload or {})
+        merged.update(kwargs)
+        self._handle_internal_event(event_name, merged)
         if self.event_sink is not None:
-            merged = dict(payload or {})
-            merged.update(kwargs)
             self.event_sink(event_name, merged)
 
 

@@ -2,6 +2,7 @@
 import platform
 import tempfile
 import pathlib
+import os
 
 from PyInstaller.utils.hooks import collect_all
 
@@ -48,6 +49,7 @@ a = Analysis(
         + [
             ('img/icon.ico', 'img'),
             ('img/dancecardiscordrtc.mp4', 'img'),
+            ('mtproxy_seed.json', '.'),
         ]
     ),
     hiddenimports=(
@@ -58,7 +60,6 @@ a = Analysis(
             'darkdetect',
             'pystray',
             'qrcode',
-            'TelethonFakeTLS',
             'telethon',
             'cryptography',
             'PIL',
@@ -117,8 +118,8 @@ app = BUNDLE(
     info_plist={
         'CFBundleName': 'MTProxy AutoSwitch',
         'CFBundleDisplayName': 'MTProxy AutoSwitch',
-        'CFBundleShortVersionString': '1.0.0',
-        'CFBundleVersion': '1.0.0',
+        'CFBundleShortVersionString': '1.2',
+        'CFBundleVersion': '1.2',
         'LSMinimumSystemVersion': '10.15',
         'NSHighResolutionCapable': True,
         'NSAppleEventsUsageDescription':

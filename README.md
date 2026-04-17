@@ -7,30 +7,32 @@
 `https://github.com/Flowseal/tg-ws-proxy`
 
 В оригинальном проекте основной сценарий работы — локальный proxy frontend. В этом форке добавлены:
+
 - парсинг веб- и Telegram-источников
 - дедупликация и фильтрация списков
 - фоновая проверка доступности и стабильности
-- авто-подбор лучшего upstream-прокси
+- автоподбор лучшего upstream MTProto proxy
 - экспорт рабочих списков
+- автообновление приложения
 
 ## Что умеет приложение
 
-- Поднимать локальный MTProto proxy для Telegram на `127.0.0.1:1443`
-- Автоматически выбирать лучший upstream MTProto proxy
-- Собирать MTProto и SOCKS5 из веб-источников
-- Парсить публичные Telegram-каналы через `t.me/s/...`
-- Парсить Telegram-каналы, группы, сообщения и ветки через Telegram API после входа в аккаунт
-- Проверять прокси в фоне без полного обновления списка
-- Делать `deep media check` и строгую media-проверку для сложных сетей
-- Отправлять список рабочих прокси себе в `Избранное`
-- Экспортировать результаты в папку `list`
-- Проверять и устанавливать обновления приложения
+- поднимать локальный MTProto proxy для Telegram на `127.0.0.1:1443`
+- автоматически выбирать лучший upstream MTProto proxy
+- собирать MTProto и SOCKS5 из веб-источников
+- парсить публичные Telegram-каналы через `t.me/s/...`
+- парсить Telegram-каналы, группы, сообщения и ветки через Telegram API после входа в аккаунт
+- проверять прокси в фоне без полного обновления списка
+- делать `deep media check` и строгую media-проверку для сложных сетей
+- отправлять список рабочих прокси себе в `Избранное`
+- экспортировать результаты в папку `list`
+- проверять и устанавливать обновления приложения
 
 ## Что лежит в репозитории
 
 - `mtproxy_gui.py` — интерфейс приложения
 - `mtproxy_app_backend.py` — runtime, refresh, экспорт, локальный frontend
-- `mtproxy_local_proxy.py` — локальный MTProto/Fake TLS frontend и pool upstream-прокси
+- `mtproxy_local_proxy.py` — локальный MTProto frontend и pool upstream-прокси
 - `mtproxy_collector.py` — веб-парсинг и первичная проверка прокси
 - `mtproxy_telegram.py` — Telegram API, авторизация, Telegram-источники, media-check
 - `mtproxy_updater.py` — автообновление приложения
@@ -40,20 +42,38 @@
 
 ## Как пользоваться
 
-1. Запустите приложение.
+1. Установите и запустите приложение.
 2. Нажмите `Обновить`, чтобы собрать и проверить прокси.
 3. Нажмите `Пуск`, чтобы поднять локальный proxy frontend.
 4. Подключите Telegram к локальному proxy:
    `https://t.me/proxy?server=127.0.0.1&port=1443&secret=<secret>`
 5. Если нужно, скопируйте ссылку кнопкой на главном экране.
 
+## Где хранятся данные
+
+Приложение старается отделять установленные файлы от пользовательских данных.
+
+Windows:
+
+- приложение ставится в `%LOCALAPPDATA%\Programs\MTProxy AutoSwitch`
+- пользовательские данные хранятся в `%APPDATA%\MTProxyAutoSwitch`
+
+macOS:
+
+- приложение ставится в `/Applications/MTProxyAutoSwitch.app`
+- пользовательские данные хранятся в `~/Library/Application Support/MTProxyAutoSwitch`
+
+Это позволяет обновлять приложение через установщик без потери конфигурации, сессии Telegram и сохраненных списков.
+
 ## Когда нужен вход в Telegram
 
 Вход в Telegram не нужен для:
+
 - обычного веб-парса сайтов
 - работы локального proxy frontend
 
 Вход в Telegram нужен для:
+
 - Telegram-источников, где нужен доступ через Telegram API
 - приватных каналов, групп и веток
 - `deep media check`
@@ -65,6 +85,7 @@
 ## Источники
 
 Поддерживаются:
+
 - веб-страницы с прямыми `https://t.me/proxy?...`
 - публичные Telegram-страницы `https://t.me/s/...`
 - Telegram API-источники вида `https://t.me/<channel>`
@@ -79,9 +100,24 @@
 - `list/socks5_list.txt` — найденные SOCKS5
 - `list/report.json` — подробный отчет
 
+## Обновления
+
+Новый релизный формат использует установщики:
+
+- Windows: `MTProxyAutoSwitch-Setup.exe`
+- macOS: `MTProxyAutoSwitch.pkg`
+
+Переходный режим для старых клиентов сохранен:
+
+- Windows-релиз по-прежнему публикует `MTProxyAutoSwitch.zip`
+- старые portable-клиенты могут обновиться через legacy ZIP-канал
+- после этого новые версии будут предпочитать установщик
+
+На macOS основной канал обновления теперь тоже ориентирован на установщик. Старые сборки, которые не умели ставиться автоматически, могут потребовать один ручной переход на `.pkg`.
+
 ## Сборка Windows
 
-### Release
+Требование: установленный Inno Setup 6 (`ISCC.exe`).
 
 ```bat
 build_release.bat
@@ -90,20 +126,36 @@ build_release.bat
 Результат:
 
 ```text
-release-public\MTProxyAutoSwitch\MTProxyAutoSwitch.exe
+release-public\MTProxyAutoSwitch-Setup.exe
 release-public\MTProxyAutoSwitch.zip
 ```
 
+`MTProxyAutoSwitch-Setup.exe` — основной установщик. Он:
+
+- ставит приложение в `%LOCALAPPDATA%\Programs\MTProxy AutoSwitch`
+- добавляет ярлык в меню «Пуск»
+- может добавить ярлык на рабочий стол
+- регистрирует удаление приложения
+
+`MTProxyAutoSwitch.zip` сохраняется как legacy-канал для старых portable-клиентов, чтобы переход на установочный формат не сломал автообновление.
+
 ## Сборка macOS
 
-### Release
+Сборку нужно выполнять на самой macOS.
 
 ```bash
 chmod +x build_release_macos.sh
 ./build_release_macos.sh
 ```
 
-Для macOS сборку нужно выполнять на самой macOS. Из-под Windows корректный `.app` не собирается.
+Результат:
+
+```text
+release-macos/MTProxyAutoSwitch.app
+release-macos/MTProxyAutoSwitch.pkg
+```
+
+`MTProxyAutoSwitch.pkg` — основной установщик для macOS. Он ставит приложение в `/Applications`, после чего оно появляется в списке приложений и Launchpad.
 
 ## Зависимости для сборки
 
@@ -111,10 +163,29 @@ chmod +x build_release_macos.sh
 - `pip install -r requirements.txt`
 - `pip install pyinstaller`
 
-Если в проекте используются `customtkinter`, `telethon`, `requests`, `beautifulsoup4`, `cryptography`, они тоже должны быть установлены в окружении сборки.
+Windows:
+
+- Inno Setup 6
+
+macOS:
+
+- Xcode Command Line Tools
+- `pkgbuild`
+
+Если в проекте используются `customtkinter`, `telethon`, `cryptography`, `pillow`, `imageio`, `imageio-ffmpeg`, они должны быть установлены в окружении сборки. Релизные скрипты ставят эти зависимости автоматически.
+
+## Публикация релиза
+
+Для GitHub Release теперь нужно выкладывать:
+
+- Windows: `MTProxyAutoSwitch-Setup.exe`
+- Windows legacy: `MTProxyAutoSwitch.zip`
+- macOS: `MTProxyAutoSwitch.pkg`
+
+Если хочешь сохранить ручную установку drag-and-drop для тестов на macOS, можно дополнительно прикладывать `.app` или отдельный `.dmg`, но основным каналом должен оставаться `.pkg`.
 
 ## Авторы
 
-- Оригинальный проект Flowseal: `https://github.com/Flowseal/tg-ws-proxy`
-- Форк и развитие: `https://github.com/pengvench/MTProxyAutoSwitch`
+- оригинальный проект Flowseal: `https://github.com/Flowseal/tg-ws-proxy`
+- форк и развитие: `https://github.com/pengvench/MTProxyAutoSwitch`
 - Telegram автора: `https://t.me/peppe_poppo`

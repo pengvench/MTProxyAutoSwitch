@@ -29,7 +29,6 @@ customtkinter
 darkdetect
 pystray
 qrcode
-TelethonFakeTLS
 telethon
 certifi
 cryptography
@@ -43,18 +42,15 @@ pyobjc-framework-Quartz
 
 ## Output
 
-The application bundle will be created at:
+The build produces:
 
 ```text
-release-macos/MTProxyAutoSwitch/MTProxyAutoSwitch.app
+release-macos/MTProxyAutoSwitch.app
+release-macos/MTProxyAutoSwitch.pkg
 ```
 
-The script also copies:
-
-- `README.txt`
-- `config.json`
-- `mtproxy_seed.json`
-- `list/proxy_list.txt`
+Use `MTProxyAutoSwitch.pkg` as the normal installer.
+It installs the app to `/Applications`, so the app shows up in Applications and Launchpad.
 
 On macOS the build now targets the current CPU architecture by default:
 
@@ -67,15 +63,15 @@ If you really need a different target, override it explicitly:
 MTPROXY_TARGET_ARCH=universal2 ./build_release_macos.sh
 ```
 
-When the app runs from a `.app` bundle, it first looks for `config.json`, `.env` and `list/` next to the bundle in `release-macos/MTProxyAutoSwitch/`.
 The app stores mutable state in `~/Library/Application Support/MTProxyAutoSwitch/`.
+Bundled seed data is embedded into the app bundle, so installed builds still have a startup proxy pool.
 
 ## Gatekeeper
 
 If macOS blocks the app on first launch, remove quarantine attributes:
 
 ```bash
-xattr -dr com.apple.quarantine release-macos/MTProxyAutoSwitch/MTProxyAutoSwitch.app
+xattr -dr com.apple.quarantine release-macos/MTProxyAutoSwitch.app
 ```
 
 ## Telegram API credentials

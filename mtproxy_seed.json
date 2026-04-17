@@ -6,37 +6,6 @@
   ],
   "proxies": [
     {
-      "url": "https://t.me/proxy?server=144.31.237.90&port=2050&secret=ee3c9444b211c71301559aae25c40bfa506d61782e7275",
-      "host": "144.31.237.90",
-      "port": 2050,
-      "secret": "ee3c9444b211c71301559aae25c40bfa506d61782e7275",
-      "sources": [
-        "https://mtproxy.tg/",
-        "https://mtproxytg.netlify.app/",
-        "https://mtproxytg2.vercel.app/"
-      ],
-      "discovered_from": [
-        "https://mtproxy.tg/",
-        "https://mtproxytg.netlify.app/",
-        "https://mtproxytg2.vercel.app/"
-      ],
-      "accepted": true,
-      "reason": "ok",
-      "attempts": 4,
-      "successes": 4,
-      "failures": 0,
-      "success_rate": 1.0,
-      "avg_latency_ms": 129.26,
-      "p95_latency_ms": 142.97,
-      "min_latency_ms": 121.71,
-      "max_latency_ms": 142.97,
-      "high_latency_ratio": 0.0,
-      "max_consecutive_failures": 0,
-      "max_consecutive_high_latency": 0,
-      "elapsed_seconds": 6.16,
-      "early_stop": null
-    },
-    {
       "url": "https://t.me/proxy?server=104.238.167.131&port=443&secret=cb3e4c331796df70645d8de629f6999a",
       "host": "104.238.167.131",
       "port": 443,

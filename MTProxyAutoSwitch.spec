@@ -38,6 +38,7 @@ a = Analysis(
         + [
             ('img/icon.ico', 'img'),
             ('img/dancecardiscordrtc.mp4', 'img'),
+            ('mtproxy_seed.json', '.'),
         ]
     ),
     hiddenimports=(
@@ -48,7 +49,6 @@ a = Analysis(
             'darkdetect',
             'pystray',
             'qrcode',
-            'TelethonFakeTLS',
             'telethon',
             'cryptography',
             'PIL',

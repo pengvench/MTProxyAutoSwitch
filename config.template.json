@@ -23,8 +23,6 @@
   "local_host": "127.0.0.1",
   "local_port": 1443,
   "local_secret": "274763e0d711fd394e833938dd93c8c3",
-  "local_fake_tls_enabled": false,
-  "local_fake_tls_domain": "",
   "auto_start_local": true,
   "autostart_enabled": false,
   "start_minimized_to_tray": false,

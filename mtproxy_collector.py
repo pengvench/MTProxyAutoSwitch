@@ -23,7 +23,6 @@ from urllib.request import Request, urlopen
 from telethon import TelegramClient, functions
 from telethon.network.connection.tcpmtproxy import ConnectionTcpMTProxyRandomizedIntermediate
 from telethon.sessions import MemorySession
-from TelethonFakeTLS import ConnectionTcpMTProxyFakeTLS
 
 from mtproxy_net import create_insecure_ssl_context, create_verified_ssl_context, is_tls_verification_error
 
@@ -321,6 +320,8 @@ def normalize_host(host: str) -> str | None:
 def normalize_secret(secret: str) -> str | None:
     secret = "".join(secret.strip().split()).lower()
     if not secret or "${" in secret or "{{" in secret:
+        return None
+    if secret.startswith("ee"):
         return None
     if not SECRET_RE.fullmatch(secret):
         return None
@@ -652,12 +653,8 @@ def scrape_source(
 
 
 def create_probe_client(proxy: ProxyRecord, timeout: float) -> TelegramClient:
-    if proxy.secret.startswith("ee"):
-        connection = ConnectionTcpMTProxyFakeTLS
-        proxy_tuple = (proxy.host, proxy.port, proxy.secret[2:])
-    else:
-        connection = ConnectionTcpMTProxyRandomizedIntermediate
-        proxy_tuple = (proxy.host, proxy.port, proxy.secret)
+    connection = ConnectionTcpMTProxyRandomizedIntermediate
+    proxy_tuple = (proxy.host, proxy.port, proxy.secret)
 
     return TelegramClient(
         MemorySession(),

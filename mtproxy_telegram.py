@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import ctypes
 import datetime
+import io
 import re
 import threading
 import time
@@ -14,7 +15,6 @@ from typing import Any
 from telethon import TelegramClient, errors, types
 from telethon.network.connection.tcpmtproxy import ConnectionTcpMTProxyRandomizedIntermediate
 from telethon.sessions import StringSession
-from TelethonFakeTLS import ConnectionTcpMTProxyFakeTLS
 from cryptography.fernet import Fernet
 
 try:
@@ -51,6 +51,14 @@ DEFAULT_QR_TOTAL_TIMEOUT = 90.0
 SESSION_KEY_FILE_NAME = "session_key.bin"
 DPI_WINDOW_MIN_BYTES = 14 * 1024
 DPI_WINDOW_MAX_BYTES = 22 * 1024
+DEEP_MEDIA_DOWNLOAD_SAMPLE_BYTES = 2 * 1024 * 1024
+DEEP_MEDIA_UPLOAD_SAMPLE_BYTES = 768 * 1024
+LIGHT_MEDIA_DOWNLOAD_SAMPLE_BYTES = 1024 * 1024
+LIGHT_MEDIA_UPLOAD_SAMPLE_BYTES = 384 * 1024
+DEEP_MEDIA_TARGET_VIDEOS = 2
+LIGHT_MEDIA_TARGET_VIDEOS = 1
+MEDIA_PROBE_AUX_TARGET = 1
+DOWNLOAD_PROBE_WARMUP_BYTES = 128 * 1024
 
 
 def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
@@ -72,6 +80,9 @@ class MediaProbeResult:
     score: float | None
     note: str
     elapsed_ms: float | None
+    upload_kbps: float | None = None
+    download_kbps: float | None = None
+    aux_kbps: float | None = None
 
 
 @dataclass(frozen=True)
@@ -140,12 +151,8 @@ def build_client(
     connection = None
 
     if upstream_proxy is not None:
-        if upstream_proxy.secret.startswith("ee"):
-            connection = ConnectionTcpMTProxyFakeTLS
-            proxy_tuple = (upstream_proxy.host, upstream_proxy.port, upstream_proxy.secret[2:])
-        else:
-            connection = ConnectionTcpMTProxyRandomizedIntermediate
-            proxy_tuple = (upstream_proxy.host, upstream_proxy.port, upstream_proxy.secret)
+        connection = ConnectionTcpMTProxyRandomizedIntermediate
+        proxy_tuple = (upstream_proxy.host, upstream_proxy.port, upstream_proxy.secret)
 
     kwargs: dict[str, Any] = {
         "receive_updates": receive_updates,
@@ -729,57 +736,82 @@ async def deep_media_probe(
         if not await _await_timeout(client.is_user_authorized(), _remaining(deadline, 8.0), "auth_status"):
             return MediaProbeResult(proxy.key, None, "session_not_authorized", None)
 
-        results: list[tuple[str, float, int]] = []
-        for username in sample_channels:
-            entity = await _await_timeout(client.get_entity(username), _remaining(deadline, 8.0), "get_entity")
-            iterator = client.iter_messages(entity, limit=40)
-            while True:
-                if time.perf_counter() >= deadline:
-                    raise RuntimeError("media_probe_timeout")
-                try:
-                    message = await _await_timeout(iterator.__anext__(), _remaining(deadline, 8.0), "iter_messages")
-                except StopAsyncIteration:
-                    break
-                media_kind = _detect_media_kind(message)
-                if media_kind is None:
-                    continue
-                elapsed_ms, downloaded, note = await _download_sample_bytes(
-                    client,
-                    message,
-                    max_bytes=192 * 1024,
-                    timeout=_remaining(deadline, 12.0),
+        video_samples, aux_samples = await _collect_media_probe_samples(
+            client,
+            sample_channels,
+            deadline=deadline,
+            target_videos=DEEP_MEDIA_TARGET_VIDEOS,
+            target_aux=MEDIA_PROBE_AUX_TARGET,
+        )
+        if not video_samples:
+            return MediaProbeResult(proxy.key, None, "no_video_samples_found", None)
+
+        video_downloads_kbps: list[float] = []
+        video_kinds: list[str] = []
+        for message, media_kind in video_samples:
+            download_elapsed_ms, downloaded, note = await _download_sample_bytes(
+                client,
+                message,
+                max_bytes=DEEP_MEDIA_DOWNLOAD_SAMPLE_BYTES,
+                timeout=_remaining(deadline, 14.0),
+            )
+            if note == "dpi_16_20kb_suspected":
+                return MediaProbeResult(
+                    proxy.key,
+                    0.0,
+                    f"{media_kind} dpi_16_20kb_suspected",
+                    round((time.perf_counter() - started_at) * 1000.0, 2),
                 )
-                if note == "dpi_16_20kb_suspected":
-                    return MediaProbeResult(
-                        proxy.key,
-                        0.0,
-                        f"{media_kind} dpi_16_20kb_suspected",
-                        round((time.perf_counter() - started_at) * 1000.0, 2),
-                    )
-                if downloaded > 0:
-                    results.append((media_kind, elapsed_ms, downloaded))
-                break
-            if len(results) >= 2:
-                break
+            if downloaded <= 0:
+                continue
+            video_downloads_kbps.append(_rate_kbps(downloaded, download_elapsed_ms))
+            video_kinds.append(media_kind)
+        if not video_downloads_kbps:
+            return MediaProbeResult(proxy.key, None, "video_download_failed", None)
 
-        if not results:
-            return MediaProbeResult(proxy.key, None, "no_media_samples_found", None)
+        aux_rates: list[tuple[str, float]] = []
+        for message, media_kind in aux_samples:
+            aux_elapsed_ms, aux_downloaded, aux_note = await _download_sample_bytes(
+                client,
+                message,
+                max_bytes=256 * 1024,
+                timeout=_remaining(deadline, 8.0),
+            )
+            if aux_note == "dpi_16_20kb_suspected":
+                return MediaProbeResult(
+                    proxy.key,
+                    0.0,
+                    f"{media_kind} dpi_16_20kb_suspected",
+                    round((time.perf_counter() - started_at) * 1000.0, 2),
+                )
+            if aux_downloaded > 0:
+                aux_rates.append((media_kind, _rate_kbps(aux_downloaded, aux_elapsed_ms)))
 
-        avg_latency = sum(item[1] for item in results) / len(results)
-        score = 1.0
-        if avg_latency > 3_000.0:
-            score = 0.35
-        elif avg_latency > 2_000.0:
-            score = 0.55
-        elif avg_latency > 1_200.0:
-            score = 0.75
-
-        covered = "+".join(sorted({item[0] for item in results}))
+        upload_elapsed_ms, uploaded = await _upload_video_probe_sample(
+            client,
+            size_bytes=DEEP_MEDIA_UPLOAD_SAMPLE_BYTES,
+            timeout=_remaining(deadline, 14.0),
+        )
+        upload_kbps = _rate_kbps(uploaded, upload_elapsed_ms)
+        score = _score_hybrid_media_probe(
+            video_downloads_kbps=video_downloads_kbps,
+            upload_kbps=upload_kbps,
+            aux_downloads_kbps=[rate for _kind, rate in aux_rates],
+            expected_video_samples=DEEP_MEDIA_TARGET_VIDEOS,
+        )
         return MediaProbeResult(
             proxy.key,
             score,
-            f"{covered} ok",
+            _format_hybrid_probe_note(
+                video_kinds=video_kinds,
+                video_downloads_kbps=video_downloads_kbps,
+                upload_kbps=upload_kbps,
+                aux_rates=aux_rates,
+            ),
             round((time.perf_counter() - started_at) * 1000.0, 2),
+            upload_kbps=upload_kbps,
+            download_kbps=min(video_downloads_kbps) if video_downloads_kbps else None,
+            aux_kbps=aux_rates[0][1] if aux_rates else None,
         )
     except Exception as exc:
         return MediaProbeResult(
@@ -810,51 +842,85 @@ async def light_media_probe(
         if not await _await_timeout(client.is_user_authorized(), _remaining(deadline, 6.0), "auth_status"):
             return MediaProbeResult(proxy.key, None, "session_not_authorized", None)
 
-        for username in sample_channels:
-            entity = await _await_timeout(client.get_entity(username), _remaining(deadline, 6.0), "get_entity")
-            iterator = client.iter_messages(entity, limit=24)
-            while True:
-                if time.perf_counter() >= deadline:
-                    raise RuntimeError("light_media_probe_timeout")
-                try:
-                    message = await _await_timeout(iterator.__anext__(), _remaining(deadline, 6.0), "iter_messages")
-                except StopAsyncIteration:
-                    break
-                media_kind = _detect_media_kind(message)
-                if media_kind is None:
-                    continue
-                elapsed_ms, downloaded, note = await _download_sample_bytes(
-                    client,
-                    message,
-                    max_bytes=128 * 1024,
-                    timeout=_remaining(deadline, 8.0),
-                )
-                if note == "dpi_16_20kb_suspected":
-                    return MediaProbeResult(
-                        proxy.key,
-                        0.0,
-                        f"{media_kind} dpi_16_20kb_suspected",
-                        round((time.perf_counter() - started_at) * 1000.0, 2),
-                    )
-                if downloaded <= 0:
-                    continue
+        video_samples, aux_samples = await _collect_media_probe_samples(
+            client,
+            sample_channels,
+            deadline=deadline,
+            target_videos=LIGHT_MEDIA_TARGET_VIDEOS,
+            target_aux=MEDIA_PROBE_AUX_TARGET,
+            per_channel_limit=24,
+        )
+        if not video_samples:
+            return MediaProbeResult(proxy.key, None, "no_video_samples_found", None)
 
-                score = 1.0
-                if elapsed_ms > 2_800.0:
-                    score = 0.35
-                elif elapsed_ms > 1_800.0:
-                    score = 0.55
-                elif elapsed_ms > 1_000.0:
-                    score = 0.75
-
+        video_downloads_kbps: list[float] = []
+        video_kinds: list[str] = []
+        for message, media_kind in video_samples:
+            elapsed_ms, downloaded, note = await _download_sample_bytes(
+                client,
+                message,
+                max_bytes=LIGHT_MEDIA_DOWNLOAD_SAMPLE_BYTES,
+                timeout=_remaining(deadline, 8.0),
+            )
+            if note == "dpi_16_20kb_suspected":
                 return MediaProbeResult(
                     proxy.key,
-                    score,
-                    f"{media_kind} ok",
+                    0.0,
+                    f"{media_kind} dpi_16_20kb_suspected",
                     round((time.perf_counter() - started_at) * 1000.0, 2),
                 )
+            if downloaded <= 0:
+                continue
+            video_downloads_kbps.append(_rate_kbps(downloaded, elapsed_ms))
+            video_kinds.append(media_kind)
+        if not video_downloads_kbps:
+            return MediaProbeResult(proxy.key, None, "video_download_failed", None)
 
-        return MediaProbeResult(proxy.key, None, "no_media_samples_found", None)
+        aux_rates: list[tuple[str, float]] = []
+        for message, media_kind in aux_samples:
+            aux_elapsed_ms, aux_downloaded, aux_note = await _download_sample_bytes(
+                client,
+                message,
+                max_bytes=160 * 1024,
+                timeout=_remaining(deadline, 5.0),
+            )
+            if aux_note == "dpi_16_20kb_suspected":
+                return MediaProbeResult(
+                    proxy.key,
+                    0.0,
+                    f"{media_kind} dpi_16_20kb_suspected",
+                    round((time.perf_counter() - started_at) * 1000.0, 2),
+                )
+            if aux_downloaded > 0:
+                aux_rates.append((media_kind, _rate_kbps(aux_downloaded, aux_elapsed_ms)))
+
+        upload_elapsed_ms, uploaded = await _upload_video_probe_sample(
+            client,
+            size_bytes=LIGHT_MEDIA_UPLOAD_SAMPLE_BYTES,
+            timeout=_remaining(deadline, 7.0),
+        )
+        upload_kbps = _rate_kbps(uploaded, upload_elapsed_ms)
+        score = _score_hybrid_media_probe(
+            video_downloads_kbps=video_downloads_kbps,
+            upload_kbps=upload_kbps,
+            aux_downloads_kbps=[rate for _kind, rate in aux_rates],
+            expected_video_samples=LIGHT_MEDIA_TARGET_VIDEOS,
+        )
+
+        return MediaProbeResult(
+            proxy.key,
+            score,
+            _format_hybrid_probe_note(
+                video_kinds=video_kinds,
+                video_downloads_kbps=video_downloads_kbps,
+                upload_kbps=upload_kbps,
+                aux_rates=aux_rates,
+            ),
+            round((time.perf_counter() - started_at) * 1000.0, 2),
+            upload_kbps=upload_kbps,
+            download_kbps=min(video_downloads_kbps) if video_downloads_kbps else None,
+            aux_kbps=aux_rates[0][1] if aux_rates else None,
+        )
     except Exception as exc:
         return MediaProbeResult(
             proxy.key,
@@ -865,6 +931,37 @@ async def light_media_probe(
     finally:
         _save_session(config.session_path, client)
         await _disconnect_quietly(client)
+
+
+async def _collect_media_probe_samples(
+    client: TelegramClient,
+    channels: list[str],
+    *,
+    deadline: float,
+    target_videos: int,
+    target_aux: int,
+    per_channel_limit: int = 40,
+) -> tuple[list[tuple[Any, str]], list[tuple[Any, str]]]:
+    video_samples: list[tuple[Any, str]] = []
+    aux_samples: list[tuple[Any, str]] = []
+    for username in channels:
+        entity = await _await_timeout(client.get_entity(username), _remaining(deadline, 8.0), "get_entity")
+        iterator = client.iter_messages(entity, limit=per_channel_limit)
+        while True:
+            if time.perf_counter() >= deadline:
+                raise RuntimeError("media_probe_timeout")
+            try:
+                message = await _await_timeout(iterator.__anext__(), _remaining(deadline, 8.0), "iter_messages")
+            except StopAsyncIteration:
+                break
+            media_kind = _detect_media_kind(message)
+            if media_kind in {"video", "video_note"} and len(video_samples) < target_videos:
+                video_samples.append((message, media_kind))
+            elif media_kind in {"photo", "document"} and len(aux_samples) < target_aux:
+                aux_samples.append((message, media_kind))
+            if len(video_samples) >= target_videos and len(aux_samples) >= target_aux:
+                return video_samples, aux_samples
+    return video_samples, aux_samples
 
 
 async def send_proxy_list_to_saved_messages(
@@ -1008,12 +1105,138 @@ def _detect_media_kind(message: Any) -> str | None:
     if document is None:
         return None
 
+    mime_type = str(getattr(document, "mime_type", "") or "").lower()
     for attribute in getattr(document, "attributes", []) or []:
         if getattr(attribute, "voice", False):
             return "voice"
         if getattr(attribute, "round_message", False):
             return "video_note"
+        if isinstance(attribute, types.DocumentAttributeVideo):
+            return "video"
+    if mime_type.startswith("video/"):
+        return "video"
     return "document"
+
+
+async def _upload_video_probe_sample(
+    client: TelegramClient,
+    *,
+    size_bytes: int,
+    timeout: float,
+) -> tuple[float, int]:
+    started_at = time.perf_counter()
+    payload = io.BytesIO(b"\x00" * max(64 * 1024, int(size_bytes)))
+    payload.name = "mtproxy_probe.mp4"
+    await _await_timeout(
+        client.upload_file(payload, part_size_kb=64),
+        max(2.0, float(timeout)),
+        "upload_video",
+    )
+    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+    return elapsed_ms, int(size_bytes)
+
+
+def _rate_kbps(transferred_bytes: int, elapsed_ms: float) -> float:
+    if transferred_bytes <= 0 or elapsed_ms <= 0:
+        return 0.0
+    return (float(transferred_bytes) / max(float(elapsed_ms) / 1000.0, 0.001)) / 1024.0
+
+
+def _format_probe_rate_kbps(rate_kbps: float) -> str:
+    value = max(0.0, float(rate_kbps or 0.0))
+    if value >= 1024.0:
+        return f"{value / 1024.0:.1f}MB/s"
+    return f"{value:.0f}KB/s"
+
+
+def _score_hybrid_media_probe(
+    *,
+    video_downloads_kbps: list[float],
+    upload_kbps: float,
+    aux_downloads_kbps: list[float],
+    expected_video_samples: int,
+) -> float:
+    safe_videos = [max(0.0, float(item or 0.0)) for item in video_downloads_kbps if float(item or 0.0) > 0.0]
+    if not safe_videos:
+        return 0.0
+    safe_upload = max(0.0, float(upload_kbps or 0.0))
+    video_floor = min(safe_videos)
+    video_avg = sum(safe_videos) / len(safe_videos)
+    bottleneck = min(video_floor, max(safe_upload * 0.8, 1.0))
+
+    if bottleneck >= 3_072.0:
+        score = 1.0
+    elif bottleneck >= 2_048.0:
+        score = 0.94
+    elif bottleneck >= 1_024.0:
+        score = 0.84
+    elif bottleneck >= 640.0:
+        score = 0.72
+    elif bottleneck >= 384.0:
+        score = 0.58
+    elif bottleneck >= 192.0:
+        score = 0.4
+    else:
+        score = 0.2
+
+    consistency = video_floor / max(video_avg, 1.0)
+    if len(safe_videos) >= 2:
+        if consistency < 0.55:
+            score -= 0.18
+        elif consistency < 0.75:
+            score -= 0.08
+    elif max(1, int(expected_video_samples or 1)) > 1:
+        score -= 0.06
+
+    completion_ratio = min(1.0, len(safe_videos) / max(1, int(expected_video_samples or 1)))
+    if completion_ratio < 1.0:
+        score -= (1.0 - completion_ratio) * 0.14
+
+    safe_aux = [max(0.0, float(item or 0.0)) for item in aux_downloads_kbps if float(item or 0.0) > 0.0]
+    if safe_aux:
+        aux_floor = min(safe_aux)
+        if aux_floor >= 1_024.0:
+            score += 0.05
+        elif aux_floor >= 384.0:
+            score += 0.02
+        elif aux_floor < 128.0:
+            score -= 0.03
+
+    if safe_upload < 192.0:
+        score -= 0.06
+    elif safe_upload >= 1_024.0:
+        score += 0.02
+
+    if video_floor >= 1_024.0:
+        score += 0.08
+    elif video_floor >= 640.0:
+        score += 0.04
+    elif video_floor < 160.0:
+        score -= 0.08
+
+    return max(0.0, min(1.0, score))
+
+
+def _format_hybrid_probe_note(
+    *,
+    video_kinds: list[str],
+    video_downloads_kbps: list[float],
+    upload_kbps: float,
+    aux_rates: list[tuple[str, float]],
+) -> str:
+    video_floor = min(video_downloads_kbps) if video_downloads_kbps else 0.0
+    video_avg = (sum(video_downloads_kbps) / len(video_downloads_kbps)) if video_downloads_kbps else 0.0
+    kinds = ",".join(sorted(set(video_kinds))) or "video"
+    parts = [
+        f"{kinds} ok",
+        f"dl_floor={_format_probe_rate_kbps(video_floor)}",
+        f"dl_avg={_format_probe_rate_kbps(video_avg)}",
+        f"up={_format_probe_rate_kbps(upload_kbps)}",
+    ]
+    if aux_rates:
+        aux_kind, aux_rate = aux_rates[0]
+        parts.append(f"aux={aux_kind}:{_format_probe_rate_kbps(aux_rate)}")
+    return " ".join(parts)
 
 
 async def _download_sample_bytes(
@@ -1023,7 +1246,9 @@ async def _download_sample_bytes(
     timeout: float = 12.0,
 ) -> tuple[float, int, str]:
     started_at = time.perf_counter()
-    downloaded = 0
+    downloaded_total = 0
+    measured_bytes = 0
+    measured_started_at = 0.0
     try:
         iterator = client.iter_download(message.media, request_size=64 * 1024)
     except (TypeError, AttributeError, ValueError, NotImplementedError, OSError):
@@ -1051,13 +1276,23 @@ async def _download_sample_bytes(
                 timeout=_remaining(deadline, 4.0),
                 started_at=started_at,
             )
-        downloaded += len(chunk)
-        if downloaded >= max_bytes:
+        chunk_len = len(chunk)
+        downloaded_total += chunk_len
+        if downloaded_total > DOWNLOAD_PROBE_WARMUP_BYTES:
+            if measured_started_at <= 0.0:
+                measured_started_at = time.perf_counter()
+            warmup_overlap = max(0, DOWNLOAD_PROBE_WARMUP_BYTES - (downloaded_total - chunk_len))
+            measured_bytes += max(0, chunk_len - warmup_overlap)
+        if downloaded_total >= max_bytes:
             break
-    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
-    if _looks_like_dpi_window_block(downloaded):
-        return elapsed_ms, downloaded, "dpi_16_20kb_suspected"
-    return elapsed_ms, downloaded, ""
+    if measured_started_at > 0.0 and measured_bytes > 0:
+        elapsed_ms = (time.perf_counter() - measured_started_at) * 1000.0
+    else:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        measured_bytes = downloaded_total
+    if _looks_like_dpi_window_block(downloaded_total):
+        return elapsed_ms, measured_bytes, "dpi_16_20kb_suspected"
+    return elapsed_ms, measured_bytes, ""
 
 
 async def _download_sample_bytes_fallback(

@@ -1,0 +1,18 @@
+* text=auto
+
+*.py text working-tree-encoding=UTF-8 eol=lf
+*.md text working-tree-encoding=UTF-8 eol=lf
+*.json text working-tree-encoding=UTF-8 eol=lf
+*.spec text working-tree-encoding=UTF-8 eol=lf
+*.iss text working-tree-encoding=UTF-8 eol=lf
+*.sh text working-tree-encoding=UTF-8 eol=lf
+*.bat text working-tree-encoding=UTF-8 eol=crlf
+*.ps1 text working-tree-encoding=UTF-8 eol=crlf
+*.txt text working-tree-encoding=UTF-8 eol=lf
+
+*.ico binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.mp4 binary

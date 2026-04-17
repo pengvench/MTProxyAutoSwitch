@@ -49,7 +49,7 @@ from mtproxy_app_backend import (
 )
 from mtproxy_collector import DEFAULT_SOURCES
 from mtproxy_telegram import DEFAULT_TELEGRAM_SOURCE_URLS, normalize_telegram_phone
-from mtproxy_updater import APP_PUBLIC_VERSION, fetch_latest_release, is_newer_version, launch_windows_update, prepare_windows_update
+from mtproxy_updater import APP_PUBLIC_VERSION, fetch_latest_release, is_update_available, launch_prepared_update, prepare_update
 from ui_tooltip import attach_ctk_tooltip
 
 APP_NAME = "MTProxy AutoSwitch"
@@ -117,6 +117,7 @@ COLOR_IDLE_TEXT = ("#475467", "#9AA6B2")
 COLOR_DANGER_BG = ("#D85E74", "#7F1D35")
 COLOR_DANGER_BORDER = ("#BF445A", "#9F2946")
 COLOR_DANGER_TEXT = ("#FFFFFF", "#FFFFFF")
+DISPLAY_SPEED_MIN_TRANSFER_BYTES = 128 * 1024
 
 HOSTS_PATH = Path(r"C:\Windows\System32\drivers\etc\hosts")
 HOSTS_BLOCK_BEGIN = "# MTProxy AutoSwitch Telegram Web Begin"
@@ -199,6 +200,19 @@ def _format_latency(value: float | None) -> str:
     if value in (None, 0):
         return "n/a"
     return f"{value:.0f} ms"
+
+
+def _format_rate_kbps(value: float | None) -> str:
+    if value is None or value <= 0:
+        return "n/a"
+    units = ["KB/s", "MB/s", "GB/s"]
+    scaled = float(value)
+    unit_index = 0
+    while scaled >= 1024.0 and unit_index < len(units) - 1:
+        scaled /= 1024.0
+        unit_index += 1
+    precision = 0 if scaled >= 100 else 1
+    return f"{scaled:.{precision}f} {units[unit_index]}"
 
 
 def _format_seed_source(source: str) -> str:
@@ -984,11 +998,15 @@ class MTProxyAutoSwitchApp(ctk.CTk):
                 self.iconbitmap(str(APP_ICON_PATH))
         _center_window(self, 438, 720)
         self.minsize(438, 720)
+        self.maxsize(438, 720)
+        self.resizable(False, False)
         self.configure(fg_color=COLOR_BG)
         self.protocol("WM_DELETE_WINDOW", self._on_close_requested)
         self.bind("<F11>", lambda _event: "break")
         self.log_lines: list[str] = []
         self.last_upstream: dict[str, object] = {}
+        self.last_upload_kbps: float | None = None
+        self.last_download_kbps: float | None = None
         self.auth_status: dict[str, object] = {
             "authorized": False,
             "display": "",
@@ -1028,7 +1046,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         # обработчиками в SettingsDialog (двойной paste, блокировка вставки).
         # Все entry/textbox уже имеют _bind_clipboard_shortcuts вызванным индивидуально.
 
-        self.after(180, self._process_messages)
+        self.after(100, self._process_messages)
         self.after(600, self.refresh_auth_status)
         self.after(900, self._auto_refresh_initial)
         self.after(1500, self._auto_check_updates)
@@ -1092,7 +1110,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         self.link_preview_var = tk.StringVar(value="")
         self.pool_count_var = tk.StringVar(value="0")
         self.ping_var = tk.StringVar(value="n/a")
-        self.source_var = tk.StringVar(value="Ожидание")
+        self.speed_var = tk.StringVar(value="↑ n/a\n↓ n/a")
         self.active_proxy_var = tk.StringVar(value="Еще не выбран")
         self.thread_var = tk.StringVar(value="Telegram-источники еще не проверялись")
         self.footer_var = tk.StringVar(value="Стартовая инициализация")
@@ -1254,11 +1272,20 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         self.summary_cards = [
             self._create_stat_card(summary, 0, "Рабочих", self.pool_count_var),
             self._create_stat_card(summary, 1, "Пинг", self.ping_var),
-            self._create_stat_card(summary, 2, "Источник", self.source_var),
+            self._create_stat_card(summary, 2, "Скорость", self.speed_var),
         ]
 
-        active = ctk.CTkFrame(shell, corner_radius=24, fg_color=COLOR_CARD, border_width=1, border_color=COLOR_BORDER)
+        active = ctk.CTkFrame(
+            shell,
+            corner_radius=24,
+            fg_color=COLOR_CARD,
+            border_width=1,
+            border_color=COLOR_BORDER,
+            height=190,
+        )
         active.pack(fill="both", expand=True, pady=(10, 0))
+        active.pack_propagate(False)
+        self.active_card = active
 
         ctk.CTkLabel(
             active,
@@ -1272,18 +1299,23 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             text_color=COLOR_TEXT,
             font=("Segoe UI", 13),
             justify="left",
-            wraplength=330,
+            wraplength=308,
         )
         self.active_proxy_label.pack(anchor="w", padx=16)
-        self.footer_info_label = ctk.CTkLabel(
+        self.footer_info_box = ctk.CTkTextbox(
             active,
-            textvariable=self.footer_var,
+            height=56,
+            corner_radius=0,
+            fg_color="transparent",
+            border_width=0,
             text_color=COLOR_TEXT_FAINT,
             font=("Segoe UI", 11),
-            justify="left",
-            wraplength=330,
+            activate_scrollbars=False,
+            wrap="word",
         )
-        self.footer_info_label.pack(anchor="w", padx=16, pady=(10, 14))
+        self.footer_info_box.pack(fill="x", padx=16, pady=(10, 14))
+        self.footer_info_box.insert("1.0", self.footer_var.get())
+        self.footer_info_box.configure(state="disabled")
         self._refresh_main_layout()
 
     def _create_stat_card(self, parent: ctk.CTkFrame, column: int, title: str, variable: tk.StringVar) -> ctk.CTkFrame:
@@ -1313,6 +1345,36 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         self.log_lines.append(message)
         if len(self.log_lines) > 400:
             self.log_lines = self.log_lines[-400:]
+
+    def _set_speed_display(self, upload_kbps: float | None, download_kbps: float | None) -> None:
+        self.speed_var.set(f"↑ {_format_rate_kbps(upload_kbps)}\n↓ {_format_rate_kbps(download_kbps)}")
+
+    def _update_speed_display(
+        self,
+        upload_kbps: float | None,
+        download_kbps: float | None,
+        *,
+        reset: bool = False,
+    ) -> None:
+        if reset:
+            self.last_upload_kbps = upload_kbps
+            self.last_download_kbps = download_kbps
+        else:
+            if upload_kbps is not None and upload_kbps > 0:
+                self.last_upload_kbps = upload_kbps
+            if download_kbps is not None and download_kbps > 0:
+                self.last_download_kbps = download_kbps
+        self.speed_var.set(
+            f"↑ {_format_rate_kbps(self.last_upload_kbps)}\n↓ {_format_rate_kbps(self.last_download_kbps)}"
+        )
+
+    def _set_footer_info_text(self, text: str) -> None:
+        self.footer_var.set(text)
+        if hasattr(self, "footer_info_box"):
+            self.footer_info_box.configure(state="normal")
+            self.footer_info_box.delete("1.0", "end")
+            self.footer_info_box.insert("1.0", text)
+            self.footer_info_box.configure(state="disabled")
 
     def _set_refresh_progress(self, fraction: float, text: str) -> None:
         self.refresh_fraction = max(0.0, min(1.0, float(fraction)))
@@ -1444,6 +1506,24 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             self._set_refresh_progress(1.0, f"Обновление завершено: {working} рабочих из {unique}")
             return
 
+        if event_name == "runtime_refresh_waiting":
+            reason = str(payload.get("reason", "") or "")
+            active_media = int(payload.get("active_media", 0) or 0)
+            active_heavy = int(payload.get("active_heavy", 0) or 0)
+            self._set_refresh_progress(
+                max(self.refresh_fraction or 0.02, 0.03),
+                f"Ждём завершения медиа перед {reason}  |  media={active_media} heavy={active_heavy}",
+            )
+            return
+
+        if event_name == "runtime_refresh_resumed":
+            reason = str(payload.get("reason", "") or "")
+            self._set_refresh_progress(
+                max(self.refresh_fraction or 0.03, 0.04),
+                f"Медиа завершено, продолжаем {reason}",
+            )
+            return
+
         if event_name == "seed_loaded" and not self.refresh_in_progress:
             count = int(payload.get("count", 0))
             source = str(payload.get("source", ""))
@@ -1475,6 +1555,32 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             if host and port:
                 self.active_proxy_var.set(f"{host}:{port}")
             self.ping_var.set(_format_latency(_safe_float(payload.get("latency_ms"))))
+            if bool(payload.get("is_media")):
+                self.progress_text_var.set(f"Медиа-сессия через {host}:{port}")
+            return
+
+        if event_name == "local_media_activity":
+            host = str(payload.get("host", "") or "")
+            port = str(payload.get("port", "") or "")
+            upload_kbps = _safe_float(payload.get("upload_kbps"))
+            download_kbps = _safe_float(payload.get("download_kbps"))
+            label = f"{host}:{port}" if host and port else "proxy"
+            upload_speed = _format_rate_kbps(upload_kbps)
+            download_speed = _format_rate_kbps(download_kbps)
+            self._update_speed_display(upload_kbps, download_kbps)
+            self.progress_text_var.set(f"Медиа-сессия: {label} | ↑ {upload_speed} | ↓ {download_speed}")
+            return
+
+        if event_name == "local_session_closed" and (bool(payload.get("heavy_upload")) or bool(payload.get("is_media"))):
+            success = bool(payload.get("success"))
+            bytes_up = int(payload.get("bytes_up") or 0)
+            bytes_down = int(payload.get("bytes_down") or 0)
+            upload_kbps = _safe_float(payload.get("upload_kbps")) if bytes_up >= DISPLAY_SPEED_MIN_TRANSFER_BYTES else None
+            download_kbps = _safe_float(payload.get("download_kbps")) if bytes_down >= DISPLAY_SPEED_MIN_TRANSFER_BYTES else None
+            speed = _format_rate_kbps(upload_kbps)
+            self._update_speed_display(upload_kbps, download_kbps)
+            self.progress_text_var.set(f"Выгрузка {'ok' if success else 'fail'} | {speed}")
+            return
 
     def get_runtime_state(self, *, allow_stale: bool = False) -> tuple[AppConfig, dict[str, object]]:
         if allow_stale and self.snapshot_cache and self.refresh_in_progress:
@@ -1497,7 +1603,14 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             if kind == "event":
                 _, event_name, payload = item
                 self._handle_runtime_event(event_name, payload)
-                if event_name in {"runtime_refresh_complete", "seed_loaded", "local_server_state"}:
+                if event_name in {
+                    "runtime_refresh_complete",
+                    "seed_loaded",
+                    "local_server_state",
+                    "local_media_activity",
+                    "local_session_closed",
+                    "local_upstream_selected",
+                }:
                     refresh_required = True
                 continue
 
@@ -1525,7 +1638,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
 
         if refresh_required:
             self._refresh_snapshot()
-        self.after(180, self._process_messages)
+        self.after(100, self._process_messages)
 
     def _refresh_snapshot(self) -> None:
         config, snapshot = self.get_runtime_state(allow_stale=self.refresh_in_progress)
@@ -1599,10 +1712,11 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             self.primary_hint_var.set("Сначала обновите список, затем запускайте локальный frontend.")
 
         self.pool_count_var.set(str(working_count))
-        self.source_var.set(_format_seed_source(str(snapshot.get("seed_source", ""))))
 
         display_host = "Еще не выбран"
         display_ping = "n/a"
+        display_upload_kbps = None
+        display_download_kbps = None
         if self.last_upstream:
             display_host = f"{self.last_upstream.get('host')}:{self.last_upstream.get('port')}"
             display_ping = _format_latency(_safe_float(self.last_upstream.get("latency_ms")))
@@ -1610,22 +1724,62 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             display_host = f"{best_row.get('host')}:{best_row.get('port')}"
             display_ping = _format_latency(_safe_float(best_row.get("live_latency_ms") or best_row.get("base_latency_ms")))
 
+        active_row = None
+        now_ts = time.time()
+        if self.last_upstream:
+            last_host = self.last_upstream.get("host")
+            last_port = self.last_upstream.get("port")
+            active_row = next(
+                (
+                    row for row in rows
+                    if str(row.get("host")) == str(last_host) and str(row.get("port")) == str(last_port)
+                ),
+                None,
+            )
+        if active_row is None:
+            active_row = best_row
+        fresh_live_rows = [
+            row
+            for row in rows
+            if (now_ts - (_safe_float(row.get("last_live_activity_at")) or 0.0)) <= 2.5
+            and (
+                int(row.get("active_media_connections") or 0) > 0
+                or int(row.get("active_heavy_uploads") or 0) > 0
+            )
+        ]
+        if fresh_live_rows:
+            total_upload_kbps = sum(max(0.0, _safe_float(row.get("live_media_upload_kbps")) or 0.0) for row in fresh_live_rows)
+            total_download_kbps = sum(max(0.0, _safe_float(row.get("live_media_download_kbps")) or 0.0) for row in fresh_live_rows)
+            display_upload_kbps = total_upload_kbps if total_upload_kbps > 0 else None
+            display_download_kbps = total_download_kbps if total_download_kbps > 0 else None
+        elif active_row is not None:
+            last_live_activity_at = _safe_float(active_row.get("last_live_activity_at")) or 0.0
+            live_is_fresh = (now_ts - last_live_activity_at) <= 2.5
+            if live_is_fresh:
+                display_upload_kbps = _safe_float(active_row.get("live_media_upload_kbps"))
+                display_download_kbps = _safe_float(active_row.get("live_media_download_kbps"))
+            if display_upload_kbps is None:
+                display_upload_kbps = _safe_float(active_row.get("recent_media_upload_kbps"))
+            if display_download_kbps is None:
+                display_download_kbps = _safe_float(active_row.get("recent_media_download_kbps"))
+
         self.ping_var.set(display_ping)
+        self._update_speed_display(display_upload_kbps, display_download_kbps, reset=True)
         self.active_proxy_var.set(display_host)
         telegram_sources_enabled = bool(getattr(config, "telegram_sources_enabled", config.thread_source_enabled))
         self.thread_var.set(_format_thread_status(thread_status, thread_count, enabled=telegram_sources_enabled))
 
         if self.refresh_in_progress:
-            self.footer_var.set("Идет полный пересбор и перепроверка прокси")
+            self._set_footer_info_text("Идет полный пересбор и перепроверка прокси")
         elif snapshot.get("last_refresh_finished_at"):
-            self.footer_var.set(
+            self._set_footer_info_text(
                 f"Уникальных прокси: {snapshot.get('unique_count', 0)}  |  "
                 f"Отсеяно: {snapshot.get('rejected_count', 0)}"
             )
         elif snapshot.get("seed_source"):
-            self.footer_var.set("Загружен стартовый пул. Полный refresh запустится автоматически.")
+            self._set_footer_info_text("Загружен стартовый пул. Полный refresh запустится автоматически.")
         else:
-            self.footer_var.set("Ожидание первого обновления")
+            self._set_footer_info_text("Ожидание первого обновления")
 
         if self.settings_dialog is not None and self.settings_dialog.winfo_exists():
             self.settings_dialog.refresh_from_runtime()
@@ -1674,7 +1828,11 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         def worker() -> None:
             try:
                 release = fetch_latest_release()
-                available = bool(release.tag_name) and is_newer_version(APP_PUBLIC_VERSION, release.tag_name)
+                available = bool(release.tag_name) and is_update_available(
+                    APP_PUBLIC_VERSION,
+                    release,
+                    install_dir=self.runtime.install_dir,
+                )
                 info = {
                     "checking": False,
                     "available": available,
@@ -1726,35 +1884,29 @@ class MTProxyAutoSwitchApp(ctk.CTk):
 
         def worker() -> None:
             try:
-                result = prepare_windows_update(
+                prepared_update = prepare_update(
                     install_dir=self.runtime.install_dir,
                     state_dir=self.runtime.state_dir,
                     current_version=APP_PUBLIC_VERSION,
                     progress_sink=lambda message: ui_call(lambda message=message: self._set_update_status(message)),
                 )
-                if not result.get("available"):
-                    def on_latest() -> None:
-                        self.update_info["checking"] = False
-                        self._set_update_status(f"Установлена актуальная версия {APP_PUBLIC_VERSION}")
-                        messagebox.showinfo("Обновления", "Новых версий не найдено.", parent=self)
-                    ui_call(on_latest)
-                    return
-
-                script_path = str(result.get("script_path") or "")
-                if not script_path:
-                    raise RuntimeError("update_script_missing")
 
                 def on_ready() -> None:
                     self.update_info["checking"] = False
-                    self._set_update_status(f"Обновление {self.update_info.get('tag_name') or 'готово'} загружено")
+                    release_tag = prepared_update.release.tag_name or self.update_info.get("tag_name") or "готово"
+                    self._set_update_status(f"Обновление {release_tag} загружено")
                     if messagebox.askyesno("Обновления", "Обновление загружено. Перезапустить приложение и установить его сейчас?", parent=self):
-                        launch_windows_update(script_path)
+                        launch_prepared_update(prepared_update)
                         self._quitting = True
                         self.destroy()
                 ui_call(on_ready)
             except Exception as exc:
                 def on_error() -> None:
                     self.update_info["checking"] = False
+                    if str(exc) == "release_is_current":
+                        self._set_update_status(f"Установлена актуальная версия {APP_PUBLIC_VERSION}")
+                        messagebox.showinfo("Обновления", "Новых версий не найдено.", parent=self)
+                        return
                     self._set_update_status("Не удалось установить обновление")
                     messagebox.showerror("Обновления", str(exc), parent=self)
                 ui_call(on_error)
@@ -1848,6 +2000,19 @@ class MTProxyAutoSwitchApp(ctk.CTk):
     def open_settings(self) -> None:
         if self.refresh_in_progress:
             return
+        for child in self.winfo_children():
+            if isinstance(child, SettingsDialog):
+                try:
+                    if child.winfo_exists():
+                        self.settings_dialog = child
+                        state = str(child.state())
+                        if state in {"withdrawn", "iconic"}:
+                            child.deiconify()
+                        child.lift()
+                        child.focus_force()
+                        return
+                except tk.TclError:
+                    pass
         if self.settings_dialog is not None:
             try:
                 if self.settings_dialog.winfo_exists():
@@ -1926,7 +2091,21 @@ class MTProxyAutoSwitchApp(ctk.CTk):
                 callback(result)
             self._refresh_snapshot()
 
-        self.run_runtime_call(self.runtime.run_auth_status, on_success=on_success)
+        def on_error(exc: Exception) -> None:
+            session_path = (self.runtime.root_dir / self.runtime.config.telegram_session_file).resolve()
+            self.auth_status = {
+                "authorized": False,
+                "display": "",
+                "phone": "",
+                "session_exists": session_path.exists(),
+                "error": str(exc),
+            }
+            self._append_log(f"[auth] status check failed: {exc}")
+            if callback is not None:
+                callback(self.auth_status)
+            self._refresh_snapshot()
+
+        self.run_runtime_call(self.runtime.run_auth_status, on_success=on_success, on_error=on_error)
 
     def request_auth_code(self, phone: str, callback=None) -> None:
         def on_success(result: dict[str, object]) -> None:
@@ -2027,8 +2206,8 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             self.active_proxy_label.configure(wraplength=wrap)
         if hasattr(self, "progress_thread_label"):
             self.progress_thread_label.configure(wraplength=hint_wrap)
-        if hasattr(self, "footer_info_label"):
-            self.footer_info_label.configure(wraplength=wrap)
+        if hasattr(self, "active_card"):
+            self.active_card.configure(height=200)
 
     def _refresh_main_layout(self) -> None:
         if hasattr(self, "hero_actions"):
@@ -2186,6 +2365,8 @@ class SettingsDialog(ctk.CTkToplevel):
         _set_fixed_window_size(self, 960, 760)
         self.configure(fg_color=COLOR_BG)
         self.transient(app)
+        with contextlib.suppress(Exception):
+            self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.bind("<Destroy>", self._on_destroy, add="+")
         self.bind("<Configure>", self._on_resize, add="+")
@@ -3344,8 +3525,6 @@ class SettingsDialog(ctk.CTkToplevel):
         payload["local_host"] = self.local_host_var.get().strip() or "127.0.0.1"
         payload["local_port"] = _read_int_maybe(self.local_port_var.get(), "local_port")
         payload["local_secret"] = self.local_secret_var.get().strip().lower()
-        payload["local_fake_tls_enabled"] = False
-        payload["local_fake_tls_domain"] = ""
         payload["telegram_sources_enabled"] = bool(self.telegram_sources_enabled_var.get())
         payload["telegram_sources"] = self._collect_telegram_sources_from_controls()
         payload["thread_source_enabled"] = payload["telegram_sources_enabled"]
@@ -3375,8 +3554,6 @@ class SettingsDialog(ctk.CTkToplevel):
         if validate:
             if not payload["local_secret"]:
                 raise ValueError("local_secret is required")
-            if payload["local_fake_tls_domain"]:
-                str(payload["local_fake_tls_domain"]).encode("ascii")
             if not payload["sources"]:
                 raise ValueError("sources list is empty")
             if bool(payload["telegram_sources_enabled"] or payload["deep_media_enabled"] or payload["rf_whitelist_check_enabled"]):
@@ -3445,6 +3622,8 @@ class SettingsDialog(ctk.CTkToplevel):
         auth = self.app.auth_status
         if auth.get("authorized"):
             status_text = f"Сессия активна: {auth.get('display') or auth.get('phone')}"
+        elif auth.get("error"):
+            status_text = f"Статус сессии не проверен: {auth.get('error')}"
         elif auth.get("session_exists"):
             status_text = "Сессия найдена, но авторизация не подтверждена"
         else:
@@ -3525,6 +3704,8 @@ class SettingsDialog(ctk.CTkToplevel):
         auth = self.app.auth_status
         if auth.get("authorized"):
             status_text = f"Сессия активна: {auth.get('display') or auth.get('phone')}"
+        elif auth.get("error"):
+            status_text = f"Статус сессии не проверен: {auth.get('error')}"
         elif auth.get("session_exists"):
             status_text = "Сессия найдена, но авторизация не подтверждена"
         else:
@@ -3943,8 +4124,6 @@ class SettingsDialog(ctk.CTkToplevel):
             payload["local_host"] = self.local_host_var.get().strip() or "127.0.0.1"
             payload["local_port"] = _read_int(self.local_port_var.get(), "local_port")
             payload["local_secret"] = self.local_secret_var.get().strip().lower()
-            payload["local_fake_tls_enabled"] = False
-            payload["local_fake_tls_domain"] = ""
             payload["telegram_sources_enabled"] = bool(self.telegram_sources_enabled_var.get())
             payload["telegram_sources"] = self._collect_telegram_sources_from_controls()
             payload["thread_source_enabled"] = payload["telegram_sources_enabled"]
@@ -3972,8 +4151,6 @@ class SettingsDialog(ctk.CTkToplevel):
             payload["telegram_api_hash"] = self.telegram_api_hash_var.get().strip()
             if not payload["local_secret"]:
                 raise ValueError("local_secret is required")
-            if payload["local_fake_tls_domain"]:
-                payload["local_fake_tls_domain"].encode("ascii")
             if not payload["sources"]:
                 raise ValueError("sources list is empty")
             if bool(payload["telegram_sources_enabled"] or payload["deep_media_enabled"] or payload["rf_whitelist_check_enabled"]):
@@ -4105,8 +4282,6 @@ class SettingsDialog(ctk.CTkToplevel):
             payload["local_host"] = self.local_host_var.get().strip() or "127.0.0.1"
             payload["local_port"] = _read_int(self.local_port_var.get(), "local_port")
             payload["local_secret"] = self.local_secret_var.get().strip().lower()
-            payload["local_fake_tls_enabled"] = False
-            payload["local_fake_tls_domain"] = ""
             payload["telegram_sources_enabled"] = bool(self.telegram_sources_enabled_var.get())
             payload["telegram_sources"] = self._collect_telegram_sources_from_controls()
             payload["thread_source_enabled"] = payload["telegram_sources_enabled"]
@@ -4117,8 +4292,6 @@ class SettingsDialog(ctk.CTkToplevel):
             payload["auto_update_enabled"] = bool(self.auto_update_var.get())
             payload["telegram_api_id"] = _read_int(self.telegram_api_id_var.get() or "0", "telegram_api_id", allow_zero=True)
             payload["telegram_api_hash"] = self.telegram_api_hash_var.get().strip()
-            if payload["local_fake_tls_domain"]:
-                payload["local_fake_tls_domain"].encode("ascii")
             if not payload["telegram_api_id"] or not payload["telegram_api_hash"]:
                 raise ValueError("Для входа в Telegram необходимо указать API ID и API Hash")
             self.app.apply_config(AppConfig(**payload))
@@ -4138,6 +4311,8 @@ class SettingsDialog(ctk.CTkToplevel):
             with contextlib.suppress(Exception):
                 self.after_cancel(self._tab_poll_job)
             self._tab_poll_job = None
+        with contextlib.suppress(Exception):
+            self.grab_release()
         # FIX: явно останавливаем видео-виджет при закрытии окна
         video_widget = getattr(self, "about_video_preview", None)
         if video_widget is not None:
