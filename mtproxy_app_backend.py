@@ -383,14 +383,16 @@ class AppRuntime:
         *,
         reason: str,
         cancel_event: threading.Event | None = None,
-    ) -> None:
+        max_wait_seconds: float | None = None,
+    ) -> bool:
         waiting_announced = False
+        started_at = time.monotonic()
         while self.local_server.is_running():
             pressure = self._active_media_transfer_pressure()
             if pressure["active_media"] <= 0 and pressure["active_heavy"] <= 0:
                 if waiting_announced:
                     self._emit("runtime_refresh_resumed", reason=reason)
-                return
+                return True
             if cancel_event is not None and cancel_event.is_set():
                 raise RuntimeError("refresh_cancelled")
             if not waiting_announced:
@@ -400,7 +402,15 @@ class AppRuntime:
                 )
                 self._emit("runtime_refresh_waiting", reason=reason, **pressure)
                 waiting_announced = True
+            if max_wait_seconds is not None and (time.monotonic() - started_at) >= max_wait_seconds:
+                self._log(
+                    f"[runtime] media wait timed out before {reason}; continuing refresh "
+                    f"(active_media={pressure['active_media']} active_heavy={pressure['active_heavy']})"
+                )
+                self._emit("runtime_refresh_wait_timeout", reason=reason, **pressure)
+                return False
             time.sleep(0.5)
+        return True
 
     @staticmethod
     def _raise_if_cancelled(cancel_event: threading.Event | None) -> None:
@@ -430,7 +440,6 @@ class AppRuntime:
             verbose=True,
         )
 
-        self._wait_for_media_idle(reason="refresh", cancel_event=cancel_event)
         self._log("[runtime] refreshing proxy pool")
         base_result = run_collection(
             config,
@@ -446,7 +455,6 @@ class AppRuntime:
 
         manual_proxies = [item for item in self._load_manual_list_proxies() if item.key not in known_keys]
         if manual_proxies:
-            self._wait_for_media_idle(reason="manual_list_probe", cancel_event=cancel_event)
             self._log(f"[manual-list] probing {len(manual_proxies)} proxies from existing list")
             manual_outcomes = run_async(
                 probe_all(
@@ -466,7 +474,6 @@ class AppRuntime:
         telegram_sources = self._collect_enabled_telegram_sources()
         if telegram_sources and best_upstream is not None:
             try:
-                self._wait_for_media_idle(reason="telegram_sources", cancel_event=cancel_event)
                 with self.telegram_lock:
                     thread_proxies = run_async(
                         collect_telegram_sources_proxies(
@@ -487,7 +494,6 @@ class AppRuntime:
                 self.thread_status = f"loaded:{len(thread_proxies)}"
                 new_proxies = [item for item in thread_proxies if item.key not in known_keys]
                 if new_proxies:
-                    self._wait_for_media_idle(reason="telegram_probe", cancel_event=cancel_event)
                     self._log(f"[telegram] probing {len(new_proxies)} new proxies from Telegram sources")
                     self._emit("telegram_sources_probing_started", total_proxies=len(new_proxies))
                     extra_outcomes = run_async(
@@ -521,7 +527,6 @@ class AppRuntime:
         )
 
         if (self.config.deep_media_enabled or self.config.rf_whitelist_check_enabled) and combined_working:
-            self._wait_for_media_idle(reason="deep_media", cancel_event=cancel_event)
             combined_working, combined_rejected = self._run_deep_media_checks(
                 combined_working,
                 combined_rejected,
@@ -533,7 +538,7 @@ class AppRuntime:
         self.last_outcomes = combined_outcomes
         self.last_working = combined_working
         self.last_rejected = combined_rejected
-        self._wait_for_media_idle(reason="apply_results", cancel_event=cancel_event)
+        self._wait_for_media_idle(reason="apply_results", cancel_event=cancel_event, max_wait_seconds=2.0)
         self.pool.replace_outcomes(combined_working)
         self._apply_latest_deep_media_scores()
 

@@ -62,6 +62,7 @@ class RuntimeCounters:
     recent_failures: int = 0
     recent_successes: int = 0
     live_latency_ms: float | None = None
+    connect_latency_ms: float | None = None
     last_selected_at: float = 0.0
     last_success_at: float = 0.0
     last_failure_at: float = 0.0
@@ -113,6 +114,14 @@ class UpstreamProxyState:
         if self.outcome.avg_latency_ms is not None:
             return self.outcome.avg_latency_ms
         return 9_999.0
+
+    @property
+    def telegram_ping_ms(self) -> float | None:
+        if self.counters.live_latency_ms is not None:
+            return self.counters.live_latency_ms
+        if self.outcome.avg_latency_ms is not None:
+            return self.outcome.avg_latency_ms
+        return None
 
     @property
     def media_score(self) -> float:
@@ -393,7 +402,7 @@ class ProxyPool:
             state.counters.active_connections += 1
             state.counters.last_selected_at = now
             if latency_ms is not None:
-                state.counters.live_latency_ms = latency_ms
+                state.counters.connect_latency_ms = latency_ms
                 state.counters.last_success_at = now
                 state.counters.recent_successes = min(50, state.counters.recent_successes + 1)
                 state.counters.recent_failures = max(0, state.counters.recent_failures - 1)
@@ -562,6 +571,7 @@ class ProxyPool:
                         "url": state.proxy.url,
                         "base_latency_ms": state.outcome.avg_latency_ms,
                         "live_latency_ms": state.counters.live_latency_ms,
+                        "connect_latency_ms": state.counters.connect_latency_ms,
                         "success_rate": state.outcome.success_rate,
                         "runtime_success_rate": state.runtime_success_rate,
                         "selected_count": state.counters.selected_count,
@@ -601,6 +611,7 @@ class ProxyPool:
                 "url": state.outcome.proxy.url,
                 "host": state.outcome.proxy.host,
                 "port": state.outcome.proxy.port,
+                "connect_latency_ms": state.counters.connect_latency_ms,
                 "media_score": state.media_score,
                 "deep_media_score": state.counters.deep_media_score,
                 "deep_media_upload_kbps": round(state.counters.deep_media_upload_kbps, 1),
@@ -617,41 +628,50 @@ class ProxyPool:
         items = self.select_candidates(is_media=True, limit=1)
         return items[0] if items else None
 
-    def _score(self, state: UpstreamProxyState, is_media: bool) -> float:
-        base_latency = state.avg_latency_ms
-        success_rate = max(state.outcome.success_rate, state.runtime_success_rate)
-        score = success_rate * (760.0 if is_media else 650.0)
-        score -= base_latency * (2.4 if is_media else 3.6)
-        if base_latency > 80.0:
-            score -= (base_latency - 80.0) * (0.7 if is_media else 1.2)
-        if base_latency > 140.0:
-            score -= (base_latency - 140.0) * (1.4 if is_media else 2.4)
-        if base_latency > 220.0:
-            score -= (base_latency - 220.0) * (2.0 if is_media else 3.2)
-        score -= state.counters.recent_failures * 120.0
-        score += min(20, state.counters.recent_successes) * 12.0
-        score -= state.counters.active_connections * 18.0
+    def _latency_penalty(self, state: UpstreamProxyState, is_media: bool) -> float:
+        ping_ms = state.telegram_ping_ms
+        if ping_ms is None:
+            return 0.0
+        penalty = ping_ms * (1.15 if is_media else 1.35)
+        if ping_ms > 180.0:
+            penalty += (ping_ms - 180.0) * (0.35 if is_media else 0.55)
+        if ping_ms > 320.0:
+            penalty += (ping_ms - 320.0) * (0.65 if is_media else 0.95)
+        return penalty
 
+    def _speed_score(self, state: UpstreamProxyState, is_media: bool) -> float:
+        score = 0.0
         media_score = state.media_score
         if media_score >= 0:
-            score += media_score * (2800.0 if is_media else 1800.0)
+            score += media_score * (2_200.0 if is_media else 1_400.0)
         elif is_media:
-            score -= 160.0
+            score -= 120.0
 
         if state.counters.deep_media_score is not None:
-            score += state.counters.deep_media_score * (4600.0 if is_media else 2600.0)
+            score += state.counters.deep_media_score * (3_800.0 if is_media else 2_200.0)
         if state.counters.deep_media_upload_kbps > 0.0:
-            score += min(1_800.0, state.counters.deep_media_upload_kbps * (1.6 if is_media else 0.6))
+            score += min(2_400.0, state.counters.deep_media_upload_kbps * (2.2 if is_media else 0.8))
         if state.counters.deep_media_download_kbps > 0.0:
-            score += min(2_800.0, state.counters.deep_media_download_kbps * (3.0 if is_media else 1.0))
+            score += min(4_200.0, state.counters.deep_media_download_kbps * (4.8 if is_media else 1.8))
         if state.counters.deep_media_aux_kbps > 0.0 and is_media:
-            score += min(240.0, state.counters.deep_media_aux_kbps * 0.25)
+            score += min(300.0, state.counters.deep_media_aux_kbps * 0.3)
+
         media_upload_kbps = state.counters.recent_media_upload_bps / 1024.0
         media_download_kbps = state.counters.recent_media_download_bps / 1024.0
         if media_upload_kbps > 0.0:
-            score += min(1_100.0, media_upload_kbps * (1.0 if is_media else 0.3))
+            score += min(1_900.0, media_upload_kbps * (1.7 if is_media else 0.45))
         if media_download_kbps > 0.0:
-            score += min(1_700.0, media_download_kbps * (1.8 if is_media else 0.35))
+            score += min(3_200.0, media_download_kbps * (3.2 if is_media else 0.8))
+        return score
+
+    def _score(self, state: UpstreamProxyState, is_media: bool) -> float:
+        success_rate = max(state.outcome.success_rate, state.runtime_success_rate)
+        score = success_rate * (700.0 if is_media else 620.0)
+        score -= self._latency_penalty(state, is_media)
+        score -= state.counters.recent_failures * 120.0
+        score += min(20, state.counters.recent_successes) * 12.0
+        score -= state.counters.active_connections * 18.0
+        score += self._speed_score(state, is_media)
         if is_media and state.counters.consecutive_media_failures > 0:
             score -= state.counters.consecutive_media_failures * 260.0
         deep_note = str(state.counters.deep_media_note or "")
@@ -669,18 +689,14 @@ class ProxyPool:
 
     def _media_turbo_score(self, state: UpstreamProxyState) -> float:
         score = self._score(state, True)
-        score += min(1_400.0, (state.counters.recent_media_upload_bps / 1024.0) * 1.4)
-        score += min(2_000.0, (state.counters.recent_media_download_bps / 1024.0) * 2.0)
-        score += min(2_100.0, state.counters.deep_media_upload_kbps * 2.0)
-        score += min(3_200.0, state.counters.deep_media_download_kbps * 3.4)
         live_upload_kbps = state.counters.live_media_upload_bps / 1024.0
         live_download_kbps = state.counters.live_media_download_bps / 1024.0
         if live_upload_kbps > 0.0:
-            score += min(1_200.0, live_upload_kbps * 2.0)
+            score += min(2_000.0, live_upload_kbps * 2.8)
             if state.counters.active_heavy_uploads > 0 and state.counters.live_media_upload_bps < HEAVY_MEDIA_BAD_RATE_BPS:
                 score -= 2_200.0
         if live_download_kbps > 0.0:
-            score += min(1_800.0, live_download_kbps * 2.2)
+            score += min(3_000.0, live_download_kbps * 3.0)
         if state.counters.active_heavy_uploads > 0:
             score += 260.0
         if state.counters.active_media_connections > 0:
@@ -896,11 +912,13 @@ class LocalMTProxyServer:
 
                 chosen_state = state
                 self.pool.mark_selected(state.key, latency_ms, is_media=is_media)
+                display_ping_ms = state.telegram_ping_ms
                 self._emit(
                     "local_upstream_selected",
                     host=state.proxy.host,
                     port=state.proxy.port,
-                    latency_ms=latency_ms,
+                    latency_ms=display_ping_ms,
+                    connect_latency_ms=latency_ms,
                     is_media=is_media,
                     dc_id=dc_id,
                     proxy_key=state.key,

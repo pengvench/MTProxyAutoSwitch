@@ -1524,6 +1524,14 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             )
             return
 
+        if event_name == "runtime_refresh_wait_timeout":
+            reason = str(payload.get("reason", "") or "")
+            self._set_refresh_progress(
+                max(self.refresh_fraction or 0.03, 0.04),
+                f"Медиа ещё активно, продолжаем {reason} без ожидания",
+            )
+            return
+
         if event_name == "seed_loaded" and not self.refresh_in_progress:
             count = int(payload.get("count", 0))
             source = str(payload.get("source", ""))
@@ -1554,8 +1562,8 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             port = payload.get("port")
             if host and port:
                 self.active_proxy_var.set(f"{host}:{port}")
-            self.ping_var.set(_format_latency(_safe_float(payload.get("latency_ms"))))
-            if bool(payload.get("is_media")):
+            self.ping_var.set(_format_latency(_safe_float(payload.get("latency_ms") or payload.get("connect_latency_ms"))))
+            if bool(payload.get("is_media")) and not self.refresh_in_progress:
                 self.progress_text_var.set(f"Медиа-сессия через {host}:{port}")
             return
 
@@ -1568,7 +1576,8 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             upload_speed = _format_rate_kbps(upload_kbps)
             download_speed = _format_rate_kbps(download_kbps)
             self._update_speed_display(upload_kbps, download_kbps)
-            self.progress_text_var.set(f"Медиа-сессия: {label} | ↑ {upload_speed} | ↓ {download_speed}")
+            if not self.refresh_in_progress:
+                self.progress_text_var.set(f"Медиа-сессия: {label} | ↑ {upload_speed} | ↓ {download_speed}")
             return
 
         if event_name == "local_session_closed" and (bool(payload.get("heavy_upload")) or bool(payload.get("is_media"))):
@@ -1579,7 +1588,8 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             download_kbps = _safe_float(payload.get("download_kbps")) if bytes_down >= DISPLAY_SPEED_MIN_TRANSFER_BYTES else None
             speed = _format_rate_kbps(upload_kbps)
             self._update_speed_display(upload_kbps, download_kbps)
-            self.progress_text_var.set(f"Выгрузка {'ok' if success else 'fail'} | {speed}")
+            if not self.refresh_in_progress:
+                self.progress_text_var.set(f"Выгрузка {'ok' if success else 'fail'} | {speed}")
             return
 
     def get_runtime_state(self, *, allow_stale: bool = False) -> tuple[AppConfig, dict[str, object]]:
@@ -1640,6 +1650,9 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             self._refresh_snapshot()
         self.after(100, self._process_messages)
 
+    def _is_ui_busy(self) -> bool:
+        return self.refresh_in_progress or self.runtime_call_count > 0
+
     def _refresh_snapshot(self) -> None:
         config, snapshot = self.get_runtime_state(allow_stale=self.refresh_in_progress)
         self.snapshot_cache = dict(snapshot)
@@ -1652,7 +1665,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         thread_count = int(snapshot.get("thread_proxy_count", 0))
         local_url = str(snapshot.get("local_url", ""))
 
-        ui_busy = self.refresh_in_progress or self.runtime_call_count > 0 or bool(self.update_info.get("checking"))
+        ui_busy = self._is_ui_busy()
 
         if self.refresh_in_progress:
             self.status_var.set("Обновление")
@@ -1717,16 +1730,10 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         display_ping = "n/a"
         display_upload_kbps = None
         display_download_kbps = None
-        if self.last_upstream:
-            display_host = f"{self.last_upstream.get('host')}:{self.last_upstream.get('port')}"
-            display_ping = _format_latency(_safe_float(self.last_upstream.get("latency_ms")))
-        elif best_row is not None:
-            display_host = f"{best_row.get('host')}:{best_row.get('port')}"
-            display_ping = _format_latency(_safe_float(best_row.get("live_latency_ms") or best_row.get("base_latency_ms")))
-
         active_row = None
         now_ts = time.time()
         if self.last_upstream:
+            display_host = f"{self.last_upstream.get('host')}:{self.last_upstream.get('port')}"
             last_host = self.last_upstream.get("host")
             last_port = self.last_upstream.get("port")
             active_row = next(
@@ -1738,6 +1745,31 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             )
         if active_row is None:
             active_row = best_row
+        elif best_row is None:
+            best_row = active_row
+        if not self.last_upstream and best_row is not None:
+            display_host = f"{best_row.get('host')}:{best_row.get('port')}"
+
+        ping_value = None
+        if self.last_upstream:
+            ping_value = _safe_float(self.last_upstream.get("latency_ms"))
+            if ping_value is None:
+                ping_value = _safe_float(self.last_upstream.get("connect_latency_ms"))
+        if ping_value is None and active_row is not None:
+            ping_value = _safe_float(
+                active_row.get("live_latency_ms")
+                or active_row.get("base_latency_ms")
+                or active_row.get("connect_latency_ms")
+            )
+        if ping_value is None and best_row is not None:
+            display_host = f"{best_row.get('host')}:{best_row.get('port')}"
+            ping_value = _safe_float(
+                best_row.get("live_latency_ms")
+                or best_row.get("base_latency_ms")
+                or best_row.get("connect_latency_ms")
+            )
+        display_ping = _format_latency(ping_value)
+
         fresh_live_rows = [
             row
             for row in rows
@@ -1914,7 +1946,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         threading.Thread(target=worker, daemon=True, name="mtproxy-update-install").start()
 
     def start_local_proxy(self) -> None:
-        if self.refresh_in_progress or self.runtime_call_count > 0 or bool(self.update_info.get("checking")):
+        if self._is_ui_busy():
             return
         if bool(self.snapshot_cache.get("local_running")):
             return
@@ -1930,7 +1962,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         self.after(250, self.open_local_link_in_telegram)
 
     def stop_local_proxy(self) -> None:
-        if self.refresh_in_progress or self.runtime_call_count > 0 or bool(self.update_info.get("checking")):
+        if self._is_ui_busy():
             return
         try:
             self.runtime.stop_local_server()
@@ -1943,7 +1975,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         if self.refresh_in_progress:
             self.cancel_refresh()
             return
-        if self.runtime_call_count > 0 or bool(self.update_info.get("checking")):
+        if self.runtime_call_count > 0:
             return
         self.refresh_cancel_event.clear()
         self.refresh_in_progress = True
@@ -1969,7 +2001,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         self._refresh_snapshot()
 
     def _on_primary_action(self) -> None:
-        if self.refresh_in_progress or self.runtime_call_count > 0 or bool(self.update_info.get("checking")):
+        if self._is_ui_busy():
             return
         if bool(self.snapshot_cache.get("local_running")):
             self.stop_local_proxy()
@@ -2053,9 +2085,11 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         *,
         on_success=None,
         on_error=None,
+        block_ui: bool = True,
     ) -> None:
-        self.runtime_call_count += 1
-        self._refresh_snapshot()
+        if block_ui:
+            self.runtime_call_count += 1
+            self._refresh_snapshot()
 
         def ui_call(callback) -> None:
             try:
@@ -2068,13 +2102,15 @@ class MTProxyAutoSwitchApp(ctk.CTk):
             try:
                 result = func()
             except Exception as exc:
-                ui_call(self._runtime_call_finished)
+                if block_ui:
+                    ui_call(self._runtime_call_finished)
                 if on_error is None:
                     ui_call(lambda exc=exc: messagebox.showerror("Ошибка", str(exc)))
                     return
                 ui_call(lambda exc=exc: on_error(exc))
                 return
-            ui_call(self._runtime_call_finished)
+            if block_ui:
+                ui_call(self._runtime_call_finished)
             if on_success is not None:
                 ui_call(lambda result=result: on_success(result))
 
@@ -2084,7 +2120,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
         self.runtime_call_count = max(0, self.runtime_call_count - 1)
         self._refresh_snapshot()
 
-    def refresh_auth_status(self, callback=None) -> None:
+    def refresh_auth_status(self, callback=None, *, block_ui: bool = False) -> None:
         def on_success(result: dict[str, object]) -> None:
             self.auth_status = dict(result)
             if callback is not None:
@@ -2105,7 +2141,12 @@ class MTProxyAutoSwitchApp(ctk.CTk):
                 callback(self.auth_status)
             self._refresh_snapshot()
 
-        self.run_runtime_call(self.runtime.run_auth_status, on_success=on_success, on_error=on_error)
+        self.run_runtime_call(
+            self.runtime.run_auth_status,
+            on_success=on_success,
+            on_error=on_error,
+            block_ui=block_ui,
+        )
 
     def request_auth_code(self, phone: str, callback=None) -> None:
         def on_success(result: dict[str, object]) -> None:
@@ -2237,7 +2278,7 @@ class MTProxyAutoSwitchApp(ctk.CTk):
 
     def _build_tray_menu(self) -> pystray.Menu:
         running = bool(self.snapshot_cache.get("local_running"))
-        ui_busy = self.refresh_in_progress or self.runtime_call_count > 0 or bool(self.update_info.get("checking"))
+        ui_busy = self._is_ui_busy()
         items = [
             pystray.MenuItem("Открыть", lambda icon, item: self.after(0, self._show_from_tray), default=True),
             pystray.MenuItem("Скопировать ссылку", lambda icon, item: self.after(0, self.copy_local_link)),
@@ -3776,7 +3817,7 @@ class SettingsDialog(ctk.CTkToplevel):
         self.refresh_interaction_state()
 
     def refresh_interaction_state(self) -> None:
-        busy = self.app.refresh_in_progress or self.app.runtime_call_count > 0 or bool(self.app.update_info.get("checking"))
+        busy = self.app._is_ui_busy()
         auth_required_disabled = not bool(self.app.auth_status.get("authorized"))
         for button in getattr(self, "auth_buttons", []):
             button.configure(state="disabled" if busy else "normal")
@@ -4176,7 +4217,7 @@ class SettingsDialog(ctk.CTkToplevel):
         if not self._save_before_auth():
             return
         self.auth_status_label.configure(text="Проверка статуса Telegram...")
-        self.app.refresh_auth_status(callback=lambda _: self.refresh_from_runtime())
+        self.app.refresh_auth_status(callback=lambda _: self.refresh_from_runtime(), block_ui=True)
 
     def _request_code(self) -> None:
         if not self._save_before_auth():
