@@ -1,14 +1,6 @@
-from .config import parse_dc_ip_list, proxy_config
-from .utils import balancer, build_github_opener, get_link_host, stats
+from .config import parse_dc_ip_list, proxy_config, coerce_domain_list
+from .utils import get_link_host, build_github_opener
 
-__version__ = "1.6.6"
+__version__ = "1.8.1"
 
-__all__ = [
-    "__version__",
-    "balancer",
-    "build_github_opener",
-    "get_link_host",
-    "parse_dc_ip_list",
-    "proxy_config",
-    "stats",
-]
+__all__ = ["__version__", "get_link_host", "proxy_config", "parse_dc_ip_list", "build_github_opener", "coerce_domain_list"]

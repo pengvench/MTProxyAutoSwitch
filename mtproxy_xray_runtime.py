@@ -34,8 +34,10 @@ from urllib.request import Request, urlopen
 DEFAULT_XRAY_SUBSCRIPTIONS = [
     "https://charity.invisibleshrimp.su/DGC4_hKXVZ0phvvw",
     "https://s3.toostep.top/sub/exitfy",
+    "https://raw.githubusercontent.com/zieng2/wl/refs/heads/main/vless_universal.txt",
+    "https://raw.githubusercontent.com/whoahaow/rjsxrd/refs/heads/main/githubmirror/bypass/bypass-all.txt",
     "https://mifa.world/turbo#MIFA%20%20%7C%20%20Turbo",
-    "https://mifa.world/vless#MIFA%20%20%7C%20%20Vless",
+    "https://mifa.world/vless",
     "https://mifa.world/trojan",
     "https://mifa.world/hysteria",
     "https://mifa.world/vmess",

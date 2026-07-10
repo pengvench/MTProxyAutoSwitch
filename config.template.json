@@ -86,15 +86,17 @@
   "auto_update_enabled": true,
   "telegram_api_id": 0,
   "telegram_api_hash": "",
-  "telegram_api_proxy_enabled": true,
+  "telegram_api_proxy_enabled": false,
   "telegram_api_proxy_url": "tg://proxy?server=127.0.0.1&port=1443&secret=dd274763e0d711fd394e833938dd93c8c3",
   "telegram_phone": "",
   "telegram_session_file": "telegram_user.sec",
   "xray_subscription_urls": [
     "https://charity.invisibleshrimp.su/DGC4_hKXVZ0phvvw",
     "https://s3.toostep.top/sub/exitfy",
+    "https://raw.githubusercontent.com/zieng2/wl/refs/heads/main/vless_universal.txt",
+    "https://raw.githubusercontent.com/whoahaow/rjsxrd/refs/heads/main/githubmirror/bypass/bypass-all.txt",
     "https://mifa.world/turbo#MIFA%20%20%7C%20%20Turbo",
-    "https://mifa.world/vless#MIFA%20%20%7C%20%20Vless",
+    "https://mifa.world/vless",
     "https://mifa.world/trojan",
     "https://mifa.world/hysteria",
     "https://mifa.world/vmess",
@@ -123,6 +125,8 @@
   "tg_ws_cfproxy_enabled": true,
   "tg_ws_cfproxy_priority": true,
   "tg_ws_cfproxy_user_domain": "",
+  "tg_ws_cfproxy_worker_domain": "",
+  "tg_ws_force_test_dc": false,
   "tg_ws_fake_tls_domain": "",
   "tg_ws_proxy_protocol": false
 }

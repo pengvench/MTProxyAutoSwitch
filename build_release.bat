@@ -3,14 +3,17 @@ setlocal
 
 cd /d "%~dp0"
 
-python -m pip install --upgrade -r requirements.txt
+set "PYTHON_EXE=%LocalAppData%\Programs\Python\Python312\python.exe"
+if not exist "%PYTHON_EXE%" set "PYTHON_EXE=python"
+
+"%PYTHON_EXE%" -m pip install --upgrade -r requirements.txt
 if errorlevel 1 exit /b 1
 
 if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 if exist release-public rmdir /s /q release-public
 
-pyinstaller --noconfirm --clean MTProxyAutoSwitch.spec
+"%PYTHON_EXE%" -m PyInstaller --noconfirm --clean MTProxyAutoSwitch.spec
 if errorlevel 1 exit /b 1
 
 mkdir release-public\portable\MTProxyAutoSwitch

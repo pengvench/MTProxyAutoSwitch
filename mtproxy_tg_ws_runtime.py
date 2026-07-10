@@ -8,7 +8,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from mtproxy_tg_ws import get_link_host, parse_dc_ip_list, proxy_config
+from mtproxy_tg_ws import coerce_domain_list, get_link_host, parse_dc_ip_list, proxy_config
 from mtproxy_tg_ws.tg_ws_proxy import _run
 
 
@@ -32,6 +32,8 @@ class TgWsProxyRuntimeConfig:
     cfproxy_enabled: bool = True
     cfproxy_priority: bool = True
     cfproxy_user_domain: str = ""
+    cfproxy_worker_domain: str = ""
+    force_test_dc: bool = False
     fake_tls_domain: str = ""
     proxy_protocol: bool = False
 
@@ -140,8 +142,9 @@ class TgWsProxyServer:
         proxy_config.buffer_size = max(4, int(cfg.buf_kb or 256)) * 1024
         proxy_config.pool_size = max(0, int(cfg.pool_size or 4))
         proxy_config.fallback_cfproxy = bool(cfg.cfproxy_enabled)
-        proxy_config.fallback_cfproxy_priority = bool(cfg.cfproxy_priority)
-        proxy_config.cfproxy_user_domain = str(cfg.cfproxy_user_domain or "").strip()
+        proxy_config.cfproxy_user_domains = coerce_domain_list(cfg.cfproxy_user_domain)
+        proxy_config.cfproxy_worker_domains = coerce_domain_list(cfg.cfproxy_worker_domain)
+        proxy_config.force_test_dc = bool(cfg.force_test_dc)
         proxy_config.fake_tls_domain = str(cfg.fake_tls_domain or "").strip()
         proxy_config.proxy_protocol = bool(cfg.proxy_protocol)
         logging.getLogger("tg-mtproto-proxy").setLevel(logging.INFO)

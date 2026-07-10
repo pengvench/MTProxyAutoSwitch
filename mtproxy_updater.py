@@ -14,7 +14,7 @@ from typing import Callable
 
 from mtproxy_net import create_verified_ssl_context
 
-APP_VERSION = "1.5"
+APP_VERSION = "1.5.5"
 APP_PUBLIC_VERSION = APP_VERSION
 GITHUB_REPO = "pengvench/MTProxyAutoSwitch"
 LATEST_RELEASE_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"

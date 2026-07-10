@@ -76,7 +76,7 @@ GITHUB_HOSTS_BLOCK_BEGIN = "# MTProxy AutoSwitch Github Begin"
 GITHUB_HOSTS_BLOCK_END = "# MTProxy AutoSwitch Github End"
 GITHUB_HOSTS_LINES = [
     "# Github",
-    "144.31.14.104 api.github.com",
+    "185.199.109.133 objects.githubusercontent.com",
     "185.199.109.133 raw.githubusercontent.com",
     "185.199.109.133 release-assets.githubusercontent.com",
     "185.199.108.133 private-user-images.githubusercontent.com",
@@ -492,6 +492,33 @@ def _format_reason_counts(counts: object, *, limit: int = 3) -> str:
     return ", ".join(f"{reason}: {count}" for reason, count in items[:limit])
 
 
+def _format_mtproxy_refresh_message(
+    *,
+    working: int,
+    unique: int,
+    fresh_working: int | None = None,
+    kept_previous: bool = False,
+    pool_count: int | None = None,
+    basic_working: int | None = None,
+    media_filtered: int | None = None,
+) -> str:
+    pool = pool_count if pool_count is not None else working
+    fresh = fresh_working if fresh_working is not None else working
+    if kept_previous and fresh <= 0 and pool > 0:
+        return (
+            f"Обновление завершено: 0 новых рабочих из {unique} проверенных; "
+            f"в пуле осталось {pool}"
+        )
+    basic = int(basic_working or 0)
+    filtered = int(media_filtered or 0)
+    if filtered > 0 and basic > working:
+        return (
+            f"Обновление завершено: {working} в пуле из {unique} проверенных "
+            f"({basic} прошли MTProto, {filtered} отсеяны Whitelist)"
+        )
+    return f"Обновление завершено: {working} рабочих из {unique} проверенных"
+
+
 def _runtime_task_status(name: str) -> str:
     return {
         "change_mode": "Переключение режима...",
@@ -509,12 +536,16 @@ def _runtime_task_status(name: str) -> str:
     }.get(name, "Выполняется операция...")
 
 
+def _hosts_block(begin_marker: str, end_marker: str, lines: list[str]) -> str:
+    return "\n".join([begin_marker, *lines, end_marker])
+
+
 def _telegram_web_hosts_block() -> str:
-    return "\n".join([HOSTS_BLOCK_BEGIN, *TELEGRAM_WEB_HOSTS_LINES, HOSTS_BLOCK_END])
+    return _hosts_block(HOSTS_BLOCK_BEGIN, HOSTS_BLOCK_END, list(TELEGRAM_WEB_HOSTS_LINES))
 
 
 def _github_hosts_block() -> str:
-    return "\n".join([GITHUB_HOSTS_BLOCK_BEGIN, *GITHUB_HOSTS_LINES, GITHUB_HOSTS_BLOCK_END])
+    return _hosts_block(GITHUB_HOSTS_BLOCK_BEGIN, GITHUB_HOSTS_BLOCK_END, list(GITHUB_HOSTS_LINES))
 
 
 def _strip_managed_hosts_block(text: str, begin_marker: str, end_marker: str) -> str:
@@ -541,19 +572,73 @@ def _hosts_line_key(line: str) -> str:
     return " ".join(str(line or "").split()).lower()
 
 
-def _hosts_lines_installed(text: str, lines: list[str]) -> bool:
-    present = {_hosts_line_key(line) for line in str(text or "").splitlines() if _hosts_line_key(line)}
-    required = [
-        _hosts_line_key(line)
-        for line in lines
-        if str(line or "").strip() and not str(line or "").lstrip().startswith("#")
-    ]
-    return bool(required) and all(line in present for line in required)
+def _hosts_line_names(line: str) -> set[str]:
+    content = str(line or "").split("#", 1)[0].strip()
+    fields = content.split()
+    if len(fields) < 2:
+        return set()
+    return {name.rstrip(".").lower() for name in fields[1:] if name.strip()}
 
+
+def _hosts_names(text: str) -> set[str]:
+    names: set[str] = set()
+    for line in str(text or "").splitlines():
+        names.update(_hosts_line_names(line))
+    return names
+
+
+def _hosts_lines_installed(text: str, lines: list[str]) -> bool:
+    required = set().union(*(_hosts_line_names(line) for line in lines)) if lines else set()
+    return bool(required) and required.issubset(_hosts_names(text))
+
+
+def _missing_hosts_lines(text: str, lines: list[str]) -> list[str]:
+    present = _hosts_names(text)
+    missing: list[str] = []
+    for line in lines:
+        if str(line or "").strip().startswith("#"):
+            continue
+        names = _hosts_line_names(line)
+        if names and not names.intersection(present):
+            missing.append(line)
+            present.update(names)
+    return missing
+
+
+def _updated_managed_hosts_text(text: str, begin_marker: str, end_marker: str, lines: list[str]) -> str:
+    base = _strip_managed_hosts_block(text, begin_marker, end_marker)
+    missing = _missing_hosts_lines(base, lines)
+    if not missing:
+        return base
+    comments = [line for line in lines if str(line or "").strip().startswith("#")]
+    block = _hosts_block(begin_marker, end_marker, [*comments, *missing])
+    prefix = base.rstrip()
+    return f"{prefix}\n\n{block}\n" if prefix else f"{block}\n"
+
+
+
+def _remove_domains_from_hosts(text: str, domains: set[str]) -> str:
+    result = []
+    for line in str(text or "").splitlines():
+        names = _hosts_line_names(line)
+        if names and names.intersection(domains):
+            continue
+        result.append(line)
+    return "\n".join(result).strip() + ("\n" if result else "")
+
+
+def _rewrite_managed_hosts(text: str, begin_marker: str, end_marker: str, lines: list[str]) -> str:
+    base = _strip_managed_hosts_block(text, begin_marker, end_marker)
+    domains = set()
+    for line in lines:
+        domains.update(_hosts_line_names(line))
+    base = _remove_domains_from_hosts(base, domains)
+    block = _hosts_block(begin_marker, end_marker, lines)
+    prefix = base.rstrip()
+    return f"{prefix}\n\n{block}\n" if prefix else f"{block}\n"
 
 def _managed_hosts_installed(text: str, begin_marker: str, end_marker: str, lines: list[str]) -> bool:
-    text = str(text or "")
-    return (begin_marker in text and end_marker in text) or _hosts_lines_installed(text, lines)
+    return _hosts_lines_installed(text, lines)
 
 
 def _autostart_command() -> str:
@@ -806,6 +891,7 @@ class MainWindow(QMainWindow):
         self.tray_actions: dict[str, QAction] = {}
         self.tray_mode_actions: dict[str, QAction] = {}
         self._settings_refreshing = False
+        self._settings_ui_hydrated = False
         self._settings_baseline: AppConfig | None = None
         self._last_proxy_page_refresh_at = 0.0
         self._last_progress_ui_at = 0.0
@@ -2460,6 +2546,7 @@ class MainWindow(QMainWindow):
 
     def open_settings(self) -> None:
         self._refresh_settings_from_config()
+        self._settings_ui_hydrated = True
         self.show_settings_page("home")
         self.stack.setCurrentWidget(self.settings_page)
 
@@ -2484,6 +2571,7 @@ class MainWindow(QMainWindow):
         if key == "pool":
             self._refresh_pool_table()
         elif key == "telegram":
+            self._sync_telegram_sources_checkbox_from_config()
             self._update_telegram_auth_ui()
             self.refresh_auth_status()
         elif key == "logs":
@@ -2522,9 +2610,7 @@ class MainWindow(QMainWindow):
         self.telegram_api_proxy.setText(str(cfg.telegram_api_proxy_url or DEFAULT_TELEGRAM_API_PROXY_URL))
         self.telegram_phone.setText(str(cfg.telegram_phone or ""))
         self.telegram_sources_enabled.blockSignals(True)
-        self.telegram_sources_enabled.setChecked(
-            bool(cfg.telegram_sources_enabled) and (not self._telegram_auth_known or self._telegram_authorized)
-        )
+        self.telegram_sources_enabled.setChecked(bool(cfg.telegram_sources_enabled))
         self.telegram_sources_enabled.blockSignals(False)
         self._set_list_values(self.source_list, [str(item) for item in (cfg.sources or [])])
         self._set_list_values(self.telegram_source_list, [str(item) for item in (cfg.telegram_sources or [])])
@@ -2597,10 +2683,6 @@ class MainWindow(QMainWindow):
         self.telegram_authorized_actions.setVisible(authorized)
 
         self.telegram_sources_enabled.setEnabled(True)
-        if known and not authorized:
-            self.telegram_sources_enabled.blockSignals(True)
-            self.telegram_sources_enabled.setChecked(False)
-            self.telegram_sources_enabled.blockSignals(False)
         self.telegram_sources_locked.setVisible(not authorized)
         self.auth_code_button.setEnabled(not busy and resend_remaining <= 0)
         self.auth_login_button.setEnabled(waiting_for_code and not busy)
@@ -2695,7 +2777,32 @@ class MainWindow(QMainWindow):
         }
         return messages.get(delivery_type, "Код запрошен у Telegram. Проверьте доступные способы доставки.") + suffix
 
+    def _sync_telegram_sources_checkbox_from_config(self) -> None:
+        if not hasattr(self, "telegram_sources_enabled"):
+            return
+        enabled = bool(self.runtime.config.telegram_sources_enabled)
+        if self.telegram_sources_enabled.isChecked() == enabled:
+            return
+        self.telegram_sources_enabled.blockSignals(True)
+        self.telegram_sources_enabled.setChecked(enabled)
+        self.telegram_sources_enabled.blockSignals(False)
+
+    def _telegram_sources_preference_enabled(self) -> bool:
+        if getattr(self, "_settings_ui_hydrated", False) and hasattr(self, "telegram_sources_enabled"):
+            return bool(self.telegram_sources_enabled.isChecked())
+        return bool(self.runtime.config.telegram_sources_enabled)
+
+    def _persist_telegram_sources_preference(self) -> None:
+        if self._settings_refreshing:
+            return
+        enabled = self._telegram_sources_preference_enabled()
+        self.runtime.set_telegram_sources_enabled(enabled)
+        if getattr(self, "_settings_ui_hydrated", False):
+            self._reset_settings_baseline()
+
     def _telegram_sources_toggled(self, checked: bool) -> None:
+        if self._settings_refreshing:
+            return
         if checked and not self._telegram_authorized:
             self.show_warning(
                 "Telegram-источники",
@@ -2704,7 +2811,10 @@ class MainWindow(QMainWindow):
             self.telegram_sources_enabled.blockSignals(True)
             self.telegram_sources_enabled.setChecked(False)
             self.telegram_sources_enabled.blockSignals(False)
+            self._update_telegram_sources_enabled()
+            return
         self._update_telegram_sources_enabled()
+        self._persist_telegram_sources_preference()
 
     def _update_telegram_sources_enabled(self) -> None:
         if not hasattr(self, "telegram_sources_enabled"):
@@ -2747,8 +2857,8 @@ class MainWindow(QMainWindow):
                 "telegram_api_proxy_enabled": bool(self.telegram_api_proxy_enabled.isChecked()),
                 "telegram_api_proxy_url": self.telegram_api_proxy.text().strip() or DEFAULT_TELEGRAM_API_PROXY_URL,
                 "telegram_phone": normalize_telegram_phone(self.telegram_phone.text().strip()) or self.telegram_phone.text().strip(),
-                "telegram_sources_enabled": bool(self.telegram_sources_enabled.isChecked())
-                and (not self._telegram_auth_known or self._telegram_authorized),
+                "telegram_sources_enabled": self._telegram_sources_preference_enabled(),
+                "thread_source_enabled": self._telegram_sources_preference_enabled(),
                 "telegram_sources": self._list_values(self.telegram_source_list),
                 "sources": self._list_values(self.source_list),
                 "telegram_source_max_messages": int(self.telegram_max_messages.value()),
@@ -3117,9 +3227,20 @@ class MainWindow(QMainWindow):
                     self.progress_text.setText(f"{self.progress_text.text()} ({reason_tail})")
             elif mode == "tg_ws_proxy":
                 self.progress_text.setText(str(snapshot.get("status_text") or "Локальный прокси готов"))
+            elif snapshot.get("background_refreshing"):
+                self.progress_text.setText("Обновление списка proxy...")
             else:
+                refresh_stats = dict(snapshot.get("last_refresh_stats") or {})
                 self.progress_text.setText(
-                    f"Обновление завершено: {snapshot.get('working_count', len(rows))} рабочих из {snapshot.get('unique_count', 0)}"
+                    _format_mtproxy_refresh_message(
+                        working=int(snapshot.get("working_count") or len(rows)),
+                        unique=int(snapshot.get("unique_count") or 0),
+                        fresh_working=int(refresh_stats.get("fresh_working") or snapshot.get("working_count") or 0),
+                        kept_previous=bool(refresh_stats.get("kept_previous")),
+                        pool_count=len(rows),
+                        basic_working=int(refresh_stats.get("basic_working") or 0),
+                        media_filtered=int(refresh_stats.get("media_filtered") or 0),
+                    )
                     if snapshot.get("last_refresh_finished_at")
                     else "Готов к обновлению"
                 )
@@ -3135,7 +3256,20 @@ class MainWindow(QMainWindow):
         elif mode == "tg_ws_proxy":
             self.footer_info.setText("Активен локальный TG WS frontend." if running else "TG WS frontend остановлен.")
         else:
-            self.footer_info.setText("Загружен стартовый пул. Полный refresh запустится автоматически." if rows else "Рабочий пул пока пуст.")
+            refresh_stats = dict(snapshot.get("last_refresh_stats") or {})
+            working = int(snapshot.get("working_count") or len(rows))
+            unique = int(snapshot.get("unique_count") or 0)
+            if snapshot.get("last_refresh_finished_at"):
+                if bool(refresh_stats.get("kept_previous")) and int(refresh_stats.get("fresh_working") or 0) <= 0 and len(rows) > 0:
+                    self.footer_info.setText(
+                        f"Проверено: {unique}. Новых рабочих: 0. В пуле: {len(rows)}."
+                    )
+                else:
+                    self.footer_info.setText(f"Проверено: {unique}. Рабочих в пуле: {working}.")
+            elif rows:
+                self.footer_info.setText(f"Загружен пул: {len(rows)} proxy. Можно запустить обновление.")
+            else:
+                self.footer_info.setText("Рабочий пул пока пуст.")
         self._refresh_proxy_page(only_if_visible=True)
         if hasattr(self, "pool_list") and self.stack.currentWidget() is self.settings_page and self.settings_stack.currentWidget() is self.settings_pages.get("pool"):
             self._refresh_pool_table()
@@ -3202,8 +3336,16 @@ class MainWindow(QMainWindow):
         elif event_name == "runtime_refresh_complete":
             self.progress.setVisible(True)
             self.progress.setValue(1000)
+            payload_dict = dict(payload or {})
             self.progress_text.setText(
-                f"Обновление завершено: {payload.get('working', 0)} рабочих из {payload.get('unique', 0)}"
+                _format_mtproxy_refresh_message(
+                    working=int(payload_dict.get("working") or 0),
+                    unique=int(payload_dict.get("unique") or 0),
+                    fresh_working=int(payload_dict.get("fresh_working") or payload_dict.get("working") or 0),
+                    kept_previous=bool(payload_dict.get("kept_previous")),
+                    basic_working=int(payload_dict.get("basic_working") or 0),
+                    media_filtered=int(payload_dict.get("media_filtered") or 0),
+                )
             )
         elif event_name == "xray_probe_progress":
             total = max(1, int(payload.get("total") or 1))
@@ -3679,11 +3821,11 @@ class MainWindow(QMainWindow):
     def apply_hosts_block(self) -> None:
         try:
             current = HOSTS_PATH.read_text(encoding="utf-8", errors="ignore") if HOSTS_PATH.exists() else ""
-            if _managed_hosts_installed(current, HOSTS_BLOCK_BEGIN, HOSTS_BLOCK_END, list(TELEGRAM_WEB_HOSTS_LINES)):
+            updated = _rewrite_managed_hosts(current, HOSTS_BLOCK_BEGIN, HOSTS_BLOCK_END, list(TELEGRAM_WEB_HOSTS_LINES))
+            if updated == current:
                 self._update_hosts_buttons()
-                self.show_info("Telegram Web", "Hosts-правила уже применены")
+                self.show_info("Telegram Web", "Hosts уже актуальны")
                 return
-            updated = _strip_hosts_block(current).rstrip() + "\n\n" + _telegram_web_hosts_block() + "\n"
             HOSTS_PATH.write_text(updated, encoding="utf-8")
             self._update_hosts_buttons()
             self.show_info("Telegram Web", "Hosts-правила применены")
@@ -3695,12 +3837,12 @@ class MainWindow(QMainWindow):
     def apply_github_hosts_block(self, *, silent: bool = False) -> bool:
         try:
             current = HOSTS_PATH.read_text(encoding="utf-8", errors="ignore") if HOSTS_PATH.exists() else ""
-            if _managed_hosts_installed(current, GITHUB_HOSTS_BLOCK_BEGIN, GITHUB_HOSTS_BLOCK_END, list(GITHUB_HOSTS_LINES)):
+            updated = _rewrite_managed_hosts(current, GITHUB_HOSTS_BLOCK_BEGIN, GITHUB_HOSTS_BLOCK_END, list(GITHUB_HOSTS_LINES))
+            if updated == current:
                 self._update_hosts_buttons()
                 if not silent:
-                    self.show_info("GitHub hosts", "Hosts-правила уже применены")
+                    self.show_info("GitHub hosts", "Hosts уже актуальны")
                 return True
-            updated = _strip_github_hosts_block(current).rstrip() + "\n\n" + _github_hosts_block() + "\n"
             HOSTS_PATH.write_text(updated, encoding="utf-8")
             self._update_hosts_buttons()
             if not silent:
@@ -3765,12 +3907,14 @@ class MainWindow(QMainWindow):
             self._telegram_authorized = False
             self._telegram_auth_stage = "start"
             self.auth_status.setText("Telegram не авторизован")
+        self._sync_telegram_sources_checkbox_from_config()
         self._update_telegram_auth_ui()
 
     def _auth_status_failed(self, error: str) -> None:
         self._telegram_auth_known = False
         self._telegram_authorized = False
         self.auth_status.setText(f"Ошибка проверки авторизации: {self._format_telegram_error(error)}")
+        self._sync_telegram_sources_checkbox_from_config()
         self._update_telegram_auth_ui()
 
     def _save_auth_config_inline(self) -> None:
@@ -3892,8 +4036,8 @@ class MainWindow(QMainWindow):
         self._telegram_code_requested_at = 0.0
         self._telegram_code_delivery_type = ""
         self._telegram_code_resend_timeout = TELEGRAM_CODE_RESEND_COOLDOWN_SECONDS
-        self.telegram_sources_enabled.setChecked(False)
         self.auth_status.setText("Telegram не авторизован")
+        self._sync_telegram_sources_checkbox_from_config()
         self._update_telegram_auth_ui()
 
     def send_proxy_list_to_saved(self) -> None:
@@ -3972,16 +4116,24 @@ class MainWindow(QMainWindow):
             on_success=prepared,
         )
 
+    def _reset_main_navigation(self) -> None:
+        if hasattr(self, "stack") and hasattr(self, "main_page"):
+            self.stack.setCurrentWidget(self.main_page)
+        if hasattr(self, "settings_stack") and hasattr(self, "settings_home"):
+            self.show_settings_page("home")
+
     def hide_to_tray(self) -> None:
         if not QSystemTrayIcon.isSystemTrayAvailable():
             self.show_warning("Трей недоступен", "Windows сейчас не отдает системный трей. Окно останется открытым, чтобы приложение не потерялось.")
             return
         self._ensure_tray_alive()
+        self._reset_main_navigation()
         self.hide()
         if self.tray.isVisible():
             self.tray.showMessage(APP_NAME, "Приложение продолжает работать в трее", QSystemTrayIcon.Information, 1800)
 
     def show_from_tray(self) -> None:
+        self._reset_main_navigation()
         self.showNormal()
         self.raise_()
         self.activateWindow()

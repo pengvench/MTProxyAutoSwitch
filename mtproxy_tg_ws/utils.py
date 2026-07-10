@@ -2,9 +2,7 @@ import socket as _socket
 import urllib.request
 import http.client
 
-import random
-from collections import Counter
-from typing import Dict, Iterator, List, Optional
+from typing import Optional, Dict, List
 from urllib.request import Request
 
 
@@ -36,6 +34,32 @@ _GITHUB_IPS: Dict[str, str] = {
     "raw.githubusercontent.com": "185.199.109.133",
 }
 
+DC_DEFAULT_IPS: Dict[int, str] = {
+    1: '149.154.175.50',
+    2: '149.154.167.51',
+    3: '149.154.175.100',
+    4: '149.154.167.91',
+    5: '149.154.171.5',
+    203: '91.105.192.100'
+}
+
+DC_TEST_IPS: Dict[int, str] = {
+    1: '149.154.175.10',
+    2: '149.154.167.40',
+    3: '149.154.175.117',
+}
+
+WS_PATH = '/apiws'
+WS_PATH_TEST = WS_PATH + '_test'
+
+
+def ws_domains(dc: int, is_media) -> List[str]:
+    if dc == 203:
+        dc = 2
+    if is_media is None or is_media:
+        return [f'kws{dc}-1.web.telegram.org', f'kws{dc}.web.telegram.org']
+    return [f'kws{dc}.web.telegram.org', f'kws{dc}-1.web.telegram.org']
+
 
 def human_bytes(n: int) -> str:
     for unit in ('B', 'KB', 'MB', 'GB'):
@@ -43,80 +67,6 @@ def human_bytes(n: int) -> str:
             return f"{n:.1f}{unit}"
         n /= 1024  # type: ignore
     return f"{n:.1f}TB"
-
-
-class _Stats:
-    def __init__(self):
-        self.connections_total = 0
-        self.connections_active = 0
-        self.connections_ws = 0
-        self.connections_tcp_fallback = 0
-        self.connections_cfproxy = 0
-        self.connections_bad = 0
-        self.connections_masked = 0
-        self.ws_errors = 0
-        self.bytes_up = 0
-        self.bytes_down = 0
-        self.pool_hits = 0
-        self.pool_misses = 0
-
-    def summary(self) -> str:
-        pool_total = self.pool_hits + self.pool_misses
-        pool_s = f"{self.pool_hits}/{pool_total}" if pool_total else "n/a"
-        return (
-            f"total={self.connections_total} "
-            f"active={self.connections_active} "
-            f"ws={self.connections_ws} "
-            f"tcp_fb={self.connections_tcp_fallback} "
-            f"cf={self.connections_cfproxy} "
-            f"bad={self.connections_bad} "
-            f"masked={self.connections_masked} "
-            f"err={self.ws_errors} "
-            f"pool={pool_s} "
-            f"up={human_bytes(self.bytes_up)} "
-            f"down={human_bytes(self.bytes_down)}"
-        )
-
-
-stats = _Stats()
-
-
-class _Balancer:
-    def __init__(self):
-        self.domains: List[str] = []
-        self._dc_to_domain: Dict[int, str] = {}
-
-    def update_domains_list(self, domains_list: List[str]) -> None:
-        if Counter(self.domains) == Counter(domains_list):
-            return
-
-        self.domains = domains_list[:]
-        self._dc_to_domain = {
-            dc_id: random.choice(self.domains)
-            for dc_id in (1, 2, 3, 4, 5, 203)
-        }
-
-    def update_domain_for_dc(self, dc_id: int, domain: str) -> bool:
-        if self._dc_to_domain.get(dc_id) == domain:
-            return False
-
-        self._dc_to_domain[dc_id] = domain
-        return True
-
-    def get_domains_for_dc(self, dc_id: int) -> Iterator[str]:
-        current_domain = self._dc_to_domain.get(dc_id)
-        if current_domain is not None:
-            yield current_domain
-
-        shuffled_domains = self.domains[:]
-        random.shuffle(shuffled_domains)
-
-        for domain in shuffled_domains:
-            if domain != current_domain:
-                yield domain
-
-
-balancer = _Balancer()
 
 
 def get_link_host(host: str) -> Optional[str]:
