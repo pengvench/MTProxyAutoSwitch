@@ -1104,7 +1104,7 @@ class WorldMapBackground(QWidget):
 
 
 class ConnectionButton(QPushButton):
-    """Большая круглая кнопка подключения с логотипом внутри (как в Hiddify)."""
+    """Большая круглая кнопка подключения с символом пуск/пауза внутри."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1112,33 +1112,35 @@ class ConnectionButton(QPushButton):
         self.setCursor(Qt.PointingHandCursor)
         self.setFixedSize(148, 148)
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self._icon: QIcon | None = None
-        self._icon_size = 64
+        self._running = False
         self._shadow = QGraphicsDropShadowEffect(self)
         self._shadow.setBlurRadius(16)
         self._shadow.setOffset(0, 0)
         self._shadow.setColor(QColor(0, 0, 0, 128))
         self.setGraphicsEffect(self._shadow)
 
-    def set_icon(self, icon: QIcon, size: int = 64) -> None:
-        self._icon = icon
-        self._icon_size = size
-        self.update()
+    def set_state(self, running: bool) -> None:
+        running = bool(running)
+        if running != self._running:
+            self._running = running
+            self.update()
 
     def set_glow(self, color: QColor) -> None:
         self._shadow.setColor(color)
 
     def paintEvent(self, event) -> None:  # noqa: N802
         super().paintEvent(event)
-        if self._icon is None or self._icon.isNull():
-            return
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
-        size = self._icon_size
-        pix = self._icon.pixmap(size, size)
-        x = (self.width() - pix.width()) // 2
-        y = (self.height() - pix.height()) // 2
-        painter.drawPixmap(x, y, pix)
+        painter.setRenderHint(QPainter.TextAntialiasing, True)
+        color = self.palette().color(QPalette.ButtonText)
+        painter.setPen(color)
+        font = painter.font()
+        font.setPixelSize(int(self.height() * 0.16))
+        font.setBold(True)
+        painter.setFont(font)
+        text = "Стоп" if self._running else "Пуск"
+        painter.drawText(self.rect(), Qt.AlignCenter, text)
         painter.end()
 
 
@@ -1774,7 +1776,7 @@ class MainWindow(QMainWindow):
 
         # --- Большая круглая кнопка подключения (как в Hiddify) ---
         self.primary_button = ConnectionButton()
-        self.primary_button.set_icon(_asset_icon(), 64)
+        self.primary_button.set_state(False)
         self.primary_button.setProperty("started", "false")
         self.primary_button.clicked.connect(self.primary_action)
         layout.addWidget(self.primary_button, 0, Qt.AlignHCenter)
@@ -3674,6 +3676,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "profile_subtitle"):
             self.profile_subtitle.setText("Активен" if running else "Не запущен")
         self.primary_button.setProperty("started", "true" if running else "false")
+        self.primary_button.set_state(running)
         self._apply_primary_style()
         local_endpoint = str(snapshot.get("endpoint") or f"{self.runtime.config.local_host}:{self.runtime.config.local_port}")
         self.primary_hint.setText(
