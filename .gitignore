@@ -28,3 +28,11 @@ list/
 # agent-only tooling (not needed to build)
 AGENTS.md
 _agent/
+
+# AI development files (not needed to build)
+.roo/
+.clinerules/
+.continue/
+_dump_all.txt
+_dump_head.txt
+
