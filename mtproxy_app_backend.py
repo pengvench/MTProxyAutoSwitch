@@ -156,6 +156,7 @@ MTPROXY_FULL_REFRESH_LATENCY_MS = 300.0
 MTPROXY_HEALTH_INTERVAL_SEC = 45.0
 MTPROXY_QUICK_SWITCH_COOLDOWN_SEC = 120.0
 MTPROXY_AUTO_REFRESH_COOLDOWN_SEC = 900.0
+DAILY_FULL_REFRESH_INTERVAL_SEC = 24.0 * 3600.0
 MTPROXY_QUICK_SWITCH_CONFIRM_STREAK = 2
 MTPROXY_FULL_REFRESH_CONFIRM_STREAK = 14
 MTPROXY_FULL_REFRESH_CONFIRM_SEC = 600.0
@@ -504,6 +505,36 @@ class AppRuntime:
                 paths.append(path)
         return paths
 
+    def daily_full_refresh_due_seconds(self) -> float | None:
+        """Секунд до суточного полного сбора базы прокси.
+
+        None — суточный сбор неприменим (режим не mtproxy_picker либо завершение).
+        База — результаты последней полной проверки (файлы списков + tg-кеш).
+        """
+        if self._shutdown_requested or self.config.active_mode != "mtproxy_picker":
+            return None
+        base_mtime = self._daily_refresh_base_mtime()
+        if base_mtime is None:
+            return 0.0
+        return max(0.0, DAILY_FULL_REFRESH_INTERVAL_SEC - (time.time() - base_mtime))
+
+    def _daily_refresh_base_mtime(self) -> float | None:
+        newest: float | None = None
+        for path in self._list_file_candidates(
+            FAST_LIST_FILE_NAME,
+            TG_PARSED_FILE_NAME,
+            REPORT_FILE_NAME,
+            LIST_FILE_NAME,
+            LEGACY_WORKING_FILE_NAME,
+        ):
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if newest is None or mtime > newest:
+                newest = mtime
+        return newest
+
     def shutdown(self) -> None:
         self._shutdown_requested = True
         self._refresh_in_progress.clear()
@@ -831,10 +862,13 @@ class AppRuntime:
         self.save_config()
         self.start_active_mode()
 
-    def refresh_active_mode(self, cancel_event: threading.Event | None = None, *, manual: bool = True) -> None:
+    def refresh_active_mode(self, cancel_event: threading.Event | None = None, *, manual: bool = True, fast: bool = False) -> None:
         if self._shutdown_requested:
             return
         if self.config.active_mode == "xray_core":
+            if fast:
+                self.quick_sort_active_mode(cancel_event=cancel_event)
+                return
             self._refresh_in_progress.set()
             self.last_refresh_started_at = time.time()
             try:
@@ -846,7 +880,7 @@ class AppRuntime:
         if self.config.active_mode == "tg_ws_proxy":
             self.restart_active_mode()
             return
-        self.run_refresh(cancel_event=cancel_event, manual=manual)
+        self.run_refresh(cancel_event=cancel_event, manual=manual, fast=fast)
 
     def quick_sort_active_mode(self, cancel_event: threading.Event | None = None) -> int:
         if self.config.active_mode == "xray_core":
@@ -986,7 +1020,7 @@ class AppRuntime:
         if cancel_event is not None and cancel_event.is_set():
             raise RuntimeError("refresh_cancelled")
 
-    def run_refresh(self, *, cancel_event: threading.Event | None = None, manual: bool = True) -> None:
+    def run_refresh(self, *, cancel_event: threading.Event | None = None, manual: bool = True, fast: bool = False) -> None:
         self._refresh_in_progress.set()
         previous_working = list(self.last_working)
         try:
@@ -997,8 +1031,8 @@ class AppRuntime:
             config = CollectorConfig(
                 sources=list(self.config.sources),
                 out_dir=self._out_dir_path(),
-                duration=self.config.duration,
-                interval=self.config.interval,
+                duration=min(6.0, float(self.config.duration or 35.0)) if fast else self.config.duration,
+                interval=1.5 if fast else self.config.interval,
                 timeout=self.config.timeout,
                 workers=self.config.workers,
                 max_latency_ms=self.config.max_latency_ms,
@@ -1010,7 +1044,10 @@ class AppRuntime:
                 verbose=True,
             )
 
-            self._log("[runtime] refreshing proxy pool")
+            if fast:
+                self._log("[runtime] fast refresh: fetching list sources and rechecking cached pool")
+            else:
+                self._log("[runtime] refreshing proxy pool")
             base_result = run_collection(
                 config,
                 log_sink=self._log,
@@ -1028,12 +1065,17 @@ class AppRuntime:
                 for proxy in self._load_known_working_proxy_records()
                 if proxy.key not in known_keys
             ]
+            if not known_proxies and fast:
+                self._log("[runtime] fast refresh: cached pool is empty (sources still fetched)")
             if known_proxies:
-                self._log(f"[runtime] rechecking {len(known_proxies)} known proxies from existing lists")
+                self._log(
+                    f"[runtime] rechecking {len(known_proxies)} known proxies from existing lists"
+                    + (" (fast)" if fast else "")
+                )
                 known_outcomes = run_async(
                     probe_all(
                         proxies=known_proxies,
-                        settings=self._known_proxy_probe_settings(),
+                        settings=self._known_proxy_probe_settings(fast=fast),
                         concurrency=max(1, min(max(self.config.workers, 32), 48)),
                         verbose=False,
                         log_sink=self._log,
@@ -1052,6 +1094,15 @@ class AppRuntime:
                     best_upstream = next((item.proxy for item in sorted(known_working, key=self._working_priority_key)), None)
 
             telegram_sources = self._collect_enabled_telegram_sources()
+            if telegram_sources and fast:
+                cached_thread_proxies = self._load_tg_parsed_proxy_records()
+                self.thread_status = "cached" if cached_thread_proxies else "skipped:fast"
+                self.thread_proxy_count = len(cached_thread_proxies)
+                self._log(
+                    f"[telegram] fast refresh: using cached parsed proxies "
+                    f"({len(cached_thread_proxies)}); skipping live parse"
+                )
+                telegram_sources = []
             if telegram_sources:
                 should_parse_telegram = self._telegram_source_cache_is_stale()
                 if not should_parse_telegram:
@@ -1178,6 +1229,7 @@ class AppRuntime:
                 "unique": unique_count,
                 "rejected": len(combined_rejected),
                 "kept_previous": int(kept_previous),
+                "fast": int(fast),
             }
 
             self._raise_if_cancelled(cancel_event)
@@ -1359,6 +1411,7 @@ class AppRuntime:
             }
         working_rows = self.pool.snapshot()
         current_best = self.pool.best()
+        health_report = self.pool.get_health_report()
         return {
             "mode": "mtproxy_picker",
             "active_mode": self.config.active_mode,
@@ -1369,6 +1422,8 @@ class AppRuntime:
             "rejected_count": len(self.last_rejected),
             "unique_count": len({item.proxy.key for item in self.last_outcomes}),
             "pool_rows": working_rows,
+            "health_report": health_report,
+            "leaderboard": health_report[: DEFAULT_FAST_LIST_LIMIT],
             "local_running": self.local_server.is_running(),
             "local_url": self.local_server.local_proxy_url,
             "local_tg_url": self.local_server.local_proxy_tg_url,
@@ -1399,7 +1454,18 @@ class AppRuntime:
             unreachable_failures=3,
         )
 
-    def _known_proxy_probe_settings(self) -> ProbeSettings:
+    def _known_proxy_probe_settings(self, *, fast: bool = False) -> ProbeSettings:
+        if fast:
+            return ProbeSettings(
+                duration=4.0,
+                interval=0.8,
+                timeout=max(3.0, min(4.0, float(self.config.timeout or 8.0))),
+                max_latency_ms=max(1500.0, float(self.config.max_latency_ms or 300.0) * 5.0),
+                min_success_rate=0.25,
+                max_high_latency_ratio=1.0,
+                high_latency_streak=6,
+                unreachable_failures=2,
+            )
         return ProbeSettings(
             duration=max(5.0, min(9.0, float(self.config.timeout or 8.0) + 1.0)),
             interval=1.0,
@@ -2406,6 +2472,10 @@ class AppRuntime:
             "rejected": len(rejected),
         }
 
+    def import_proxies(self, text: str) -> dict[str, int]:
+        """Alias for import_mtproxy_urls_from_text (import proxy list from text)."""
+        return self.import_mtproxy_urls_from_text(text)
+
     def delete_unavailable_mtproxies(self) -> dict[str, int]:
         if self.config.active_mode != "mtproxy_picker":
             raise RuntimeError("mtproxy_delete_requires_mtproxy_mode")
@@ -2421,13 +2491,32 @@ class AppRuntime:
             self.config.manual_upstream_url = ""
             self.save_config()
 
-        removed_from_pool = self.pool.remove_keys(delete_keys)
+        removed_from_pool = self.pool.drop_unavailable()
+        removed_from_pool += self.pool.remove_keys(delete_keys)
         self.last_working = [item for item in self.last_working if item.proxy.key not in delete_keys]
         self.last_rejected = [item for item in self.last_rejected if item.proxy.key not in delete_keys]
         self.last_outcomes = [item for item in self.last_outcomes if item.proxy.key not in delete_keys]
         self._persist_current_mtproxy_lists()
         self._emit("mtproxy_delete_finished", removed=len(delete_keys), removed_from_pool=removed_from_pool)
         return {"removed": len(delete_keys), "removed_from_pool": removed_from_pool}
+
+    def delete_unavailable_proxies(self) -> dict[str, int]:
+        """Alias for delete_unavailable_mtproxies."""
+        return self.delete_unavailable_mtproxies()
+
+    def pool_health_report(self) -> list[dict[str, Any]]:
+        """Return a health report table for the current proxy pool."""
+        return self.pool.get_health_report()
+
+    def pool_leaderboard(self, *, limit: int = 10) -> list[dict[str, Any]]:
+        """Return the top-N most stable proxies (leaderboard)."""
+        return self.pool.get_health_report()[: max(1, int(limit))]
+
+    def pool_priority_list(self) -> list[dict[str, Any]]:
+        """Return the full pool ordered by selection priority."""
+        states = self.pool.get_priority_list()
+        rows_by_key = {row["key"]: row for row in self.pool.get_health_report()}
+        return [dict(rows_by_key[state.key]) for state in states if state.key in rows_by_key]
 
     def stress_test_mtproxy_pool(self, *, limit: int = 24) -> dict[str, int]:
         if self.config.active_mode != "mtproxy_picker":
@@ -2480,7 +2569,7 @@ class AppRuntime:
 
         media_probed = 0
         if stable and auth_is_configured(self.auth_config):
-            for outcome in sorted(stable, key=outcome_sort_key)[: min(6, len(stable))]:
+            for outcome in self._select_fast_candidates(stable)[: min(6, len(stable))]:
                 result = run_async(light_media_probe(outcome.proxy, self.auth_config))
                 self._latest_deep_media_scores[outcome.proxy.key] = result
                 self.pool.update_deep_media_score(

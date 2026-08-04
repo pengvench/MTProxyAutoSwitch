@@ -20,12 +20,15 @@ from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QCloseEvent, QCursor, QDesktopServices, QFontMetrics, QIcon, QIntValidator, QPalette
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractItemView,
     QAbstractSpinBox,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -41,6 +44,9 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QStackedWidget,
     QSystemTrayIcon,
+    QTableWidget,
+    QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -226,6 +232,47 @@ QPushButton#soft:pressed {
     background: #C9BCEB;
     color: #443AA3;
     border: 1px solid #6158C7;
+}
+QToolButton {
+    min-height: 34px;
+    border-radius: 17px;
+    padding: 0 10px;
+    border: 1px solid #D5CCE4;
+    background: #FAF8FD;
+    color: #221D31;
+    font-weight: 600;
+}
+QToolButton#soft {
+    background: #E6DFF6;
+    color: #6158C7;
+    border: 1px solid #E6DFF6;
+}
+QToolButton#soft:hover {
+    background: #D9CEF3;
+    color: #5148B8;
+    border: 1px solid #BBAEE0;
+}
+QToolButton#soft:pressed {
+    background: #C9BCEB;
+    color: #443AA3;
+    border: 1px solid #6158C7;
+}
+QToolButton:disabled {
+    color: #B2A9C4;
+    background: #EEE8F5;
+    border: 1px solid #E1D9EC;
+}
+QToolButton::menu-indicator {
+    width: 12px;
+    height: 12px;
+    subcontrol-position: right center;
+    subcontrol-origin: padding;
+    right: 8px;
+}
+QToolButton#soft::menu-indicator {
+    width: 0px;
+    height: 0px;
+    image: none;
 }
 QPushButton#danger {
     background: #D95B75;
@@ -454,6 +501,14 @@ def _format_latency(value: object) -> str:
     return f"{int(round(number))} ms"
 
 
+_POOL_STATUS_LABELS = {
+    "healthy": "Здоров",
+    "weak": "Слабый",
+    "unstable": "Нестабильный",
+    "cooldown": "Кулдаун",
+}
+
+
 def _format_rate(value: object) -> str:
     number = _safe_float(value)
     if number is None or number <= 0:
@@ -528,7 +583,7 @@ def _runtime_task_status(name: str) -> str:
         "stop_local": "Остановка выбранного режима...",
         "save_settings": "Сохранение настроек...",
         "quick_sort_mode": "Быстрая сортировка по пингу...",
-        "quick_probe": "Быстрая проверка прокси...",
+        "quick_probe": "Перепроверка пула proxy...",
         "mtproxy_sort": "Сортировка MTProxy-пула...",
         "mtproxy_import": "Импорт прокси из буфера...",
         "mtproxy_delete": "Удаление нерабочих прокси...",
@@ -939,6 +994,7 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(350, self.refresh_auth_status)
         QTimer.singleShot(900, self._auto_refresh_initial)
+        QTimer.singleShot(60_000, self._check_daily_full_refresh_due)
         if self.runtime.config.auto_update_enabled:
             QTimer.singleShot(1500, self.check_updates_silent)
         if self.runtime.config.start_minimized_to_tray:
@@ -1383,12 +1439,35 @@ class MainWindow(QMainWindow):
         self.primary_hint.setAlignment(Qt.AlignCenter)
         hero_layout.addWidget(self.primary_hint)
         hero_actions = QHBoxLayout()
-        self.refresh_button = self._button("Обновить", soft=True)
+        self.refresh_button = QToolButton(self)
+        self.refresh_button.setText("Обновить")
+        self.refresh_button.setObjectName("soft")
+        self.refresh_button.setCursor(Qt.PointingHandCursor)
+        self.refresh_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.refresh_button.setPopupMode(QToolButton.InstantPopup)
+        self.refresh_button.setMinimumHeight(34)
         self.refresh_button.clicked.connect(self.start_refresh)
-        self.open_list_button = self._button("Открыть list")
-        self.open_list_button.clicked.connect(self.open_output_folder)
+        self.refresh_menu = QMenu(self)
+        self.refresh_full_action = QAction("Полное обновление", self)
+        self.refresh_full_action.triggered.connect(lambda: self.start_refresh(manual=True))
+        self.refresh_fast_action = QAction("Быстрое обновление", self)
+        self.refresh_fast_action.triggered.connect(lambda: self.start_refresh(manual=True, fast=True))
+        self.refresh_pool_action = QAction("Перепроверить пул", self)
+        self.refresh_pool_action.triggered.connect(self.quick_probe)
+        self.refresh_menu.addAction(self.refresh_full_action)
+        self.refresh_menu.addAction(self.refresh_fast_action)
+        self.refresh_menu.addAction(self.refresh_pool_action)
+        self.refresh_button.setMenu(self.refresh_menu)
+        self.stress_button = self._button("Стресс-тест")
+        self.stress_button.clicked.connect(self.stress_test_proxies)
+        # обе кнопки hero — одной ширины, без растягивания в layout
+        self.stress_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.refresh_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        hero_width = max(self.refresh_button.sizeHint().width(), self.stress_button.sizeHint().width())
+        self.refresh_button.setMinimumWidth(hero_width)
+        self.stress_button.setMinimumWidth(hero_width)
         hero_actions.addWidget(self.refresh_button)
-        hero_actions.addWidget(self.open_list_button)
+        hero_actions.addWidget(self.stress_button)
         hero_layout.addLayout(hero_actions)
         layout.addWidget(hero)
 
@@ -3022,12 +3101,17 @@ class MainWindow(QMainWindow):
             "proxy_import_button",
             "proxy_delete_button",
             "proxy_stress_button",
+            "stress_button",
         ):
             widget = getattr(self, widget_name, None)
             if widget is not None:
                 widget.setEnabled(not busy)
         if hasattr(self, "refresh_button"):
             self.refresh_button.setEnabled(True)
+            if busy:
+                self.refresh_button.setMenu(None)
+            elif hasattr(self, "refresh_menu"):
+                self.refresh_button.setMenu(self.refresh_menu)
         if hasattr(self, "copy_button"):
             self.copy_button.setEnabled(True)
         if hasattr(self, "connect_button"):
@@ -3077,7 +3161,7 @@ class MainWindow(QMainWindow):
             return
         self.run_task("stop_local", self.runtime.stop_active_mode)
 
-    def start_refresh(self, checked: bool = False, *, manual: bool = True) -> None:
+    def start_refresh(self, checked: bool = False, *, manual: bool = True, fast: bool = False) -> None:
         if self.refresh_in_progress:
             self.cancel_refresh()
             return
@@ -3090,14 +3174,14 @@ class MainWindow(QMainWindow):
         self.refresh_cancel_event = threading.Event()
         self.progress.setVisible(True)
         self.progress.setValue(20)
-        self.progress_text.setText("Подготовка к обновлению списка")
+        self.progress_text.setText("Быстрое обновление списка proxy..." if fast else "Подготовка к обновлению списка")
         self.refresh_button.setText("Отмена")
         self._update_busy_controls()
         self._refresh_tray_menu()
 
         def worker() -> None:
             try:
-                self.runtime.refresh_active_mode(cancel_event=self.refresh_cancel_event, manual=manual)
+                self.runtime.refresh_active_mode(cancel_event=self.refresh_cancel_event, manual=manual, fast=fast)
                 self.bridge.task_done.emit("refresh", True)
             except Exception as exc:
                 self.bridge.task_failed.emit("refresh", str(exc))
@@ -3118,6 +3202,16 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(700, lambda: self.progress.setVisible(False) if not self.refresh_in_progress else None)
         self._refresh_tray_menu()
         self._refresh_snapshot()
+        stats = getattr(self.runtime, "last_refresh_stats", None) or {}
+        if stats.get("fast") and not stats.get("working") and not stats.get("kept_previous"):
+            QTimer.singleShot(
+                900,
+                lambda: self.show_warning(
+                    "Не найдены рабочие прокси",
+                    "Быстрое обновление не нашло рабочих прокси в источниках и кеше. "
+                    "Выполните «Полное обновление» с длительной проверкой или проверьте источники.",
+                ),
+            )
 
     def _refresh_failed(self, error: str) -> None:
         self.refresh_in_progress = False
@@ -3142,6 +3236,23 @@ class MainWindow(QMainWindow):
             self.start_refresh(manual=False)
         elif snapshot.get("pool_rows") and not snapshot.get("local_running"):
             self.start_local_proxy()
+
+    def _check_daily_full_refresh_due(self) -> None:
+        """Суточный сбор базы прокси (полная проверка раз в сутки).
+
+        Цепочка QTimer.singleShot: в headless-тестах singleShot отключён,
+        поэтому фоновая сеть в тестах не запускается.
+        """
+        if self._runtime_shutdown_done:
+            return
+        try:
+            due_sec = self.runtime.daily_full_refresh_due_seconds()
+        except Exception:
+            due_sec = None
+        if due_sec is not None and due_sec <= 0 and not self.refresh_in_progress and not self.busy_task_names:
+            self._runtime_log("[daily] база прокси старше суток — запуск полного сбора")
+            self.start_refresh(manual=False)
+        QTimer.singleShot(30 * 60_000, self._check_daily_full_refresh_due)
 
     def _refresh_snapshot(self) -> None:
         snapshot = self.runtime.snapshot()
@@ -3538,7 +3649,11 @@ class MainWindow(QMainWindow):
         if hasattr(self, "proxy_quick_button"):
             self.proxy_quick_button.setText("Сортировать")
         mtproxy_controls = mode == "mtproxy_picker"
-        for widget_name in ("proxy_import_button", "proxy_delete_button", "proxy_stress_button"):
+        for widget_name in (
+            "proxy_import_button",
+            "proxy_delete_button",
+            "proxy_stress_button",
+        ):
             widget = getattr(self, widget_name, None)
             if widget is not None:
                 widget.setVisible(mtproxy_controls)
@@ -3611,6 +3726,7 @@ class MainWindow(QMainWindow):
             host = f"{row.get('host')}:{row.get('port')}"
             latency = _format_latency(row.get("live_latency_ms") or row.get("base_latency_ms") or row.get("connect_latency_ms"))
             tag = "Manual" if url == manual else "Fast list" if index < DEFAULT_FAST_LIST_LIMIT else "Proxy"
+            status = _POOL_STATUS_LABELS.get(str(row.get("status") or "")) or ""
             speed = ""
             up = _safe_float(row.get("recent_media_upload_kbps") or row.get("deep_media_upload_kbps"))
             down = _safe_float(row.get("recent_media_download_kbps") or row.get("deep_media_download_kbps"))
@@ -3619,7 +3735,7 @@ class MainWindow(QMainWindow):
             widget = self._proxy_card_widget(
                 badge=str(index + 1),
                 title=_trim_middle(host, 34),
-                subtitle=f"{tag} | {row.get('reason', 'ready')}{speed}",
+                subtitle=f"{status} · {tag} | {row.get('reason', 'ready')}{speed}",
                 metric=latency,
                 selected=bool(manual and url == manual),
                 active=bool(url and url == snapshot.get("best_proxy")),
@@ -3733,6 +3849,7 @@ class MainWindow(QMainWindow):
         if self._warn_runtime_busy():
             return
         if self.runtime.config.active_mode != "mtproxy_picker":
+            self.show_info("Стресс-тест", "Стресс-тест доступен только в режиме «Подбор прокси».")
             return
         self.run_task(
             "stress_test",

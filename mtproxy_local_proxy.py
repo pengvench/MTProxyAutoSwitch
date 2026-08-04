@@ -654,6 +654,77 @@ class ProxyPool:
                         "last_error": state.counters.cooldown_reason or state.counters.last_error,
                         "reason": runtime_state,
                         "score": round(self._score(state, False), 2),
+                        "status": self._health_status(state, cooldown_remaining),
+                        "manual_selected": state.key == self._manual_override_key,
+                    }
+                )
+            return rows
+
+    @staticmethod
+    def _health_status(state: UpstreamProxyState, cooldown_remaining: float) -> str:
+        if cooldown_remaining > 0.0:
+            return "cooldown"
+        rate = state.runtime_success_rate
+        if state.counters.recent_failures >= 2 or rate < 0.5:
+            return "unstable"
+        if rate < 0.8 or state.outcome.success_rate < 0.8:
+            return "weak"
+        return "healthy"
+
+    def get_stable_leaderboard(self, *, limit: int = 10) -> list[UpstreamProxyState]:
+        """Return the top-N most stable proxies ordered by current health score."""
+        with self._lock:
+            candidates = self._available_states() or list(self._states.values())
+            ordered = sorted(candidates, key=lambda item: self._score(item, False), reverse=True)
+            return ordered[: max(1, int(limit))]
+
+    def get_priority_list(self) -> list[UpstreamProxyState]:
+        """Return the full pool ordered by selection priority (manual override first)."""
+        with self._lock:
+            ordered = sorted(self._states.values(), key=lambda item: self._score(item, False), reverse=True)
+            if self._manual_override_key is not None:
+                manual_state = next((item for item in ordered if item.key == self._manual_override_key), None)
+                if manual_state is not None:
+                    ordered = [manual_state] + [item for item in ordered if item.key != manual_state.key]
+            return ordered
+
+    def drop_unavailable(self) -> int:
+        """Remove proxies currently unavailable (in cooldown or not accepted) from the pool."""
+        with self._lock:
+            now = time.time()
+            drop_keys = {
+                key
+                for key, state in self._states.items()
+                if state.counters.cooldown_until > now or not state.outcome.accepted
+            }
+            if not drop_keys:
+                return 0
+            return self.remove_keys(drop_keys)
+
+    def get_health_report(self) -> list[dict[str, Any]]:
+        """Return a health report table (status + scores) sorted by current score."""
+        with self._lock:
+            now = time.time()
+            rows: list[dict[str, Any]] = []
+            for state in sorted(self._states.values(), key=lambda item: self._score(item, False), reverse=True):
+                cooldown_remaining = max(0.0, state.counters.cooldown_until - now)
+                rows.append(
+                    {
+                        "key": state.key,
+                        "host": state.proxy.host,
+                        "port": state.proxy.port,
+                        "url": state.proxy.url,
+                        "latency_ms": state.telegram_ping_ms
+                        or state.counters.live_latency_ms
+                        or state.counters.connect_latency_ms
+                        or state.outcome.avg_latency_ms,
+                        "success_rate": state.outcome.success_rate,
+                        "runtime_success_rate": state.runtime_success_rate,
+                        "media_score": state.media_score,
+                        "deep_media_score": state.counters.deep_media_score,
+                        "score": round(self._score(state, False), 2),
+                        "status": self._health_status(state, cooldown_remaining),
+                        "reason": state.counters.cooldown_reason or state.counters.last_error or state.outcome.reason,
                         "manual_selected": state.key == self._manual_override_key,
                     }
                 )

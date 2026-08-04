@@ -17,10 +17,14 @@ release-macos/
 
 data/
 debug_screens/
-hiddify-app-main/
 tg-ws-proxy-main/
+.continue/
 *.session
 *.sec
 *.log
 
-list/report.json
+list/
+
+# agent-only tooling (not needed to build)
+AGENTS.md
+_agent/

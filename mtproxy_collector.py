@@ -66,6 +66,18 @@ DEFAULT_SOURCES = [
     "https://t.me/s/AccarMTProto",
 ]
 
+DEFAULT_SOCKS5_SOURCES = [
+    "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=5000&country=all",
+    "https://raw.githubusercontent.com/TheSpeedX/SOCKS-List/master/socks5.txt",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
+    "https://raw.githubusercontent.com/fyvri/fresh-proxy-list/archive/storage/classic/socks5.txt",
+    "https://gist.githubusercontent.com/December000/fd23d2530ffc29264297a5e687a79ecd/raw/all.yaml",
+    "https://raw.githubusercontent.com/CB-X2-Jun/proxy-lists/main/proxy.txt",
+    "https://raw.githubusercontent.com/CB-X2-Jun/proxy-lists/main/public/proxies.json",
+    "https://raw.githubusercontent.com/ProxyScrape/free-proxy-list/refs/heads/main/proxies/all/data.txt",
+]
+
 MTPROXYTG_MIRROR_GROUP = "mtproxytg mirrors"
 MTPROXYTG_MIRRORS = [f"https://mtproxytg{index}.vercel.app/" for index in range(2, 11)]
 
@@ -642,6 +654,26 @@ def scan_text(text: str, source_url: str, current_url: str) -> ScanArtifacts:
         )
         if proxy:
             artifacts.proxies.append(proxy)
+
+    # Извлекаем IP:PORT как SOCKS5 (без авторизации), исключая уже использованные как MTProto
+    ip_port_re = re.compile(r"\b(?P<host>(?:\d{1,3}\.){3}\d{1,3}):(?P<port>\d{1,5})\b")
+    existing_mtproto_ips = {p.host for p in artifacts.proxies}
+    existing_socks5_keys_set = {p.key for p in artifacts.socks5}
+    for match in ip_port_re.finditer(normalized):
+        host = match.group("host")
+        port_str = match.group("port")
+        try:
+            port = int(port_str)
+        except ValueError:
+            continue
+        if not (1 <= port <= 65535):
+            continue
+        if host in existing_mtproto_ips:
+            continue
+        proxy = make_socks5(host, port_str, None, None, source_url, current_url)
+        if proxy is not None and proxy.key not in existing_socks5_keys_set:
+            artifacts.socks5.append(proxy)
+            existing_socks5_keys_set.add(proxy.key)
 
     for match in CONFIG_URL_RE.finditer(normalized):
         artifacts.data_urls.add(urljoin(current_url, match.group(1)))
