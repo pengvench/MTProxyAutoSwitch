@@ -126,5 +126,5 @@ except ImportError:
         def encryptor(self) -> _CtrStream:
             return _CtrStream(self._key, self._iv)
 
-        # CTR is symmetric: decryption == encryption with the same keystream.
+        # CTR is symmetric — decryption == encryption with the same keystream.
         decryptor = encryptor

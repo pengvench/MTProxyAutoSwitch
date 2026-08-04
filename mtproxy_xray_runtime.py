@@ -64,6 +64,11 @@ XRAY_PROBE_SPEED_TEST_SECONDS = 2.5
 XRAY_ACTIVE_SPEED_TEST_BYTES = 128 * 1024 * 1024
 XRAY_ACTIVE_SPEED_TEST_SECONDS = 8.0
 
+# Быстрые HTTPS-цели для проверки пинга (лёгкие, без больших тел ответа).
+GSTATIC_GENERATE_204 = ("www.gstatic.com", 443, "www.gstatic.com", "/generate_204")
+IP_SB_GEOIP = ("api.ip.sb", 443, "api.ip.sb", "/geoip")
+
+
 XRAY_PROTOCOLS = {"vless", "vmess", "trojan", "shadowsocks"}
 SING_BOX_PROTOCOLS = {"hysteria", "hysteria2", "hy2"}
 XRAY_GOOD_DOWNLOAD_KBPS = 512.0
@@ -428,17 +433,21 @@ class XrayCoreRuntime:
         if self._shutdown_requested:
             return len(self.last_working)
         with self._lock:
-            nodes = [item.node for item in self.last_working]
+            # Проверяем весь найденный пул (discovered_nodes), а не только принятые ноды.
+            nodes = list(self.discovered_nodes)
+            if not nodes:
+                nodes = [item.node for item in self.last_working]
         if not nodes:
             self.refresh(cancel_event=cancel_event)
             return len(self.last_working)
 
-        self._log(f"[xray] quick ping sort for {len(nodes)} accepted nodes")
+        self._log(f"[xray] quick ping sort for {len(nodes)} nodes")
         previous_working = list(self.last_working)
         previous_active = self.active_result
         outcomes: list[XrayProbeResult] = []
-        workers = max(1, int(self.config.probe_workers or 1))
+        workers = max(8, int(self.config.probe_workers or 1) * 2)
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="xray-ping") as executor:
+
             futures = {executor.submit(self._probe_node_ping, node): node for node in nodes}
             completed = 0
             for future in as_completed(futures):
@@ -673,39 +682,41 @@ class XrayCoreRuntime:
                 creationflags=_subprocess_no_window(),
             )
             self._assign_to_process_job(proc)
-            time.sleep(0.45)
+            time.sleep(0.2)
             if proc.poll() is not None:
-                return XrayProbeResult(node, False, "core exited", None, 0, len(TELEGRAM_DCS), node.runtime)
-            dc_latencies: list[float] = []
-            for host, target_port in TELEGRAM_DCS:
-                latency = _socks_mtproto_latency(
+                return XrayProbeResult(node, False, "core exited", None, 0, len(GSTATIC_GENERATE_204) + len(IP_SB_GEOIP), node.runtime)
+            ping_latencies: list[float] = []
+            for host, target_port, server_name, path in (GSTATIC_GENERATE_204, IP_SB_GEOIP):
+                latency = _socks_https_latency(
                     "127.0.0.1",
                     port,
                     host,
                     target_port,
+                    server_name,
                     float(self.config.probe_timeout_sec or 8.0),
+                    path=path,
                 )
                 if latency is not None:
-                    dc_latencies.append(latency)
-                    break
-            if not dc_latencies:
-                return XrayProbeResult(node, False, "quick_ping_failed", None, 0, len(TELEGRAM_DCS), node.runtime)
-            dc_latency = min(dc_latencies)
-            accepted = dc_latency < 5000
+                    ping_latencies.append(latency)
+            if not ping_latencies:
+                return XrayProbeResult(node, False, "quick_ping_failed", None, 0, len(GSTATIC_GENERATE_204) + len(IP_SB_GEOIP), node.runtime)
+            ping_latency = min(ping_latencies)
+            accepted = ping_latency < 5000
             download_kbps = _xray_download_speed("127.0.0.1", port, float(self.config.probe_timeout_sec or 8.0)) if accepted else None
             return XrayProbeResult(
                 node,
                 accepted,
                 "ready" if accepted else "slow",
-                dc_latency,
-                len(dc_latencies),
-                len(TELEGRAM_DCS),
+                ping_latency,
+                len(ping_latencies),
+                len(GSTATIC_GENERATE_204) + len(IP_SB_GEOIP),
                 node.runtime,
-                dc_latency_ms=dc_latency,
+                dc_latency_ms=ping_latency,
                 download_kbps=download_kbps,
             )
         except Exception as exc:
-            return XrayProbeResult(node, False, str(exc), None, 0, len(TELEGRAM_DCS), node.runtime)
+            return XrayProbeResult(node, False, str(exc), None, 0, len(GSTATIC_GENERATE_204) + len(IP_SB_GEOIP), node.runtime)
+
         finally:
             if proc is not None and proc.poll() is None:
                 _terminate_process_tree(proc, timeout=max(0.2, 2.0 - (time.monotonic() - started_at)))
@@ -1946,6 +1957,7 @@ def _socks_https_latency(
     target_port: int,
     server_name: str,
     timeout: float,
+    path: str = "/",
 ) -> float | None:
     started = time.perf_counter()
     raw_sock: socket.socket | None = None
@@ -1958,7 +1970,7 @@ def _socks_https_latency(
         with context.wrap_socket(raw_sock, server_hostname=server_name) as tls_sock:
             raw_sock = None
             request = (
-                f"GET / HTTP/1.1\r\n"
+                f"GET {path} HTTP/1.1\r\n"
                 f"Host: {server_name}\r\n"
                 f"User-Agent: MTProxyAutoSwitch/1.0\r\n"
                 f"Connection: close\r\n\r\n"
@@ -1974,6 +1986,7 @@ def _socks_https_latency(
         if raw_sock is not None:
             with contextlib.suppress(Exception):
                 raw_sock.close()
+
 
 
 def _xray_download_speed(

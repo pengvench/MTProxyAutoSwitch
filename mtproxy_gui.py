@@ -17,7 +17,26 @@ except ImportError:  # pragma: no cover
     winreg = None
 
 from PySide6.QtCore import QEvent, QObject, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QCloseEvent, QCursor, QDesktopServices, QFontMetrics, QIcon, QIntValidator, QPalette
+from PySide6.QtGui import (
+    QAction,
+    QBrush,
+    QCloseEvent,
+    QColor,
+    QCursor,
+    QDesktopServices,
+    QFontMetrics,
+    QIcon,
+    QIntValidator,
+    QLinearGradient,
+    QPainter,
+    QPalette,
+    QPen,
+    QPixmap,
+)
+from PySide6.QtWidgets import (
+    QGraphicsDropShadowEffect,
+)
+
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -141,7 +160,6 @@ BALANCER_HELP = (
 
 QSS = """
 QWidget {
-    background: #F3F0F8;
     color: #221D31;
     font-family: "Segoe UI";
     font-size: 12px;
@@ -166,7 +184,7 @@ QScrollBar:horizontal {
 QLabel {
     background: transparent;
 }
-QFrame#card, QFrame#rowCard, QFrame#activeCard, QFrame#proxyRow, QFrame#aboutCard {
+QFrame#card, QFrame#rowCard, QFrame#activeCard, QFrame#proxyRow, QFrame#aboutCard, QFrame#profileCard, QFrame#delayCard {
     background: #FAF8FD;
     border: 1px solid #D8D1E5;
     border-radius: 22px;
@@ -176,7 +194,7 @@ QFrame#fieldCard {
     border: 1px solid #D5CCE4;
     border-radius: 18px;
 }
-QFrame#activeCard:hover, QFrame#rowCard:hover {
+QFrame#activeCard:hover, QFrame#rowCard:hover, QFrame#profileCard:hover, QFrame#delayCard:hover {
     background: #F0ECFF;
     border: 1px solid #6158C7;
 }
@@ -456,7 +474,127 @@ def _asset_icon() -> QIcon:
     return QIcon(str(APP_ICON_PATH)) if APP_ICON_PATH.exists() else QIcon()
 
 
+def _windows_accent_color() -> QColor | None:
+    """Возвращает акцентный цвет Windows (Monet-подобная система).
+
+    Читает AccentColor из реестра DWM. Формат 0xAABBGGRR.
+    """
+    if sys.platform != "win32" or winreg is None:
+        return None
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\DWM",
+            0,
+            winreg.KEY_READ,
+        ) as key:
+            value, _ = winreg.QueryValueEx(key, "AccentColor")
+        value = int(value or 0)
+        if value == 0:
+            return None
+        red = value & 0xFF
+        green = (value >> 8) & 0xFF
+        blue = (value >> 16) & 0xFF
+        return QColor(red, green, blue)
+    except Exception:
+        return None
+
+
+def _contrast_text_color(background: QColor) -> str:
+    """Возвращает белый или тёмный цвет текста, контрастный к фону (WCAG-подобно)."""
+    luminance = (0.299 * background.red() + 0.587 * background.green() + 0.114 * background.blue()) / 255.0
+    return "#FFFFFF" if luminance < 0.55 else "#221D31"
+
+
+def _hct_tone(color: QColor) -> float:
+    """Приближённый тон (lightness) в HCT-пространстве из sRGB."""
+    r = color.red() / 255.0
+    g = color.green() / 255.0
+    b = color.blue() / 255.0
+    r = r / 12.92 if r <= 0.04045 else ((r + 0.055) / 1.055) ** 2.4
+    g = g / 12.92 if g <= 0.04045 else ((g + 0.055) / 1.055) ** 2.4
+    b = b / 12.92 if b <= 0.04045 else ((b + 0.055) / 1.055) ** 2.4
+    y = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    return 116.0 * (y ** (1.0 / 3.0)) - 16.0 if y > 0.008856 else 903.3 * y
+
+
+def _tone_to_rgb(hue: float, chroma: float, tone: float) -> QColor:
+    """Приближённая конверсия HCT (hue, chroma, tone) -> sRGB через HSL."""
+    # Тон -> лёгкость (lightness) в HSL: аппроксимация L = tone/100.
+    lightness = max(0.0, min(1.0, tone / 100.0))
+    # Хрома -> насыщенность: аппроксимация S = chroma / 100.
+    saturation = max(0.0, min(1.0, chroma / 100.0))
+    color = QColor()
+    color.setHslF(hue / 360.0, saturation, lightness)
+    return color
+
+
+def _monet_palette(seed: QColor, dark: bool) -> dict[str, str]:
+    """Генерирует Material 3 tonal palette из seed-цвета (приближение HCT).
+
+    Возвращает словарь ролей: primary, onPrimary, primaryContainer,
+    onPrimaryContainer, surface, surfaceContainer, onSurface, surfaceVariant,
+    outline, outlineVariant, secondaryContainer, onSecondaryContainer.
+    """
+    hue = seed.hslHueF() * 360.0
+    if hue < 0:
+        hue = 0.0
+    chroma = max(48.0, min(100.0, seed.hslSaturationF() * 100.0))
+
+    def tone(t: float) -> QColor:
+        return _tone_to_rgb(hue, chroma, t)
+
+    def neutral(t: float) -> QColor:
+        return _tone_to_rgb(hue, 6.0, t)
+
+    def neutral_variant(t: float) -> QColor:
+        return _tone_to_rgb(hue, 12.0, t)
+
+    if dark:
+        primary = tone(80)
+        on_primary = tone(20)
+        primary_container = tone(30)
+        on_primary_container = tone(90)
+        surface = neutral(6)
+        surface_container = neutral(12)
+        on_surface = neutral(90)
+        surface_variant = neutral_variant(30)
+        outline = neutral_variant(60)
+        outline_variant = neutral_variant(30)
+        secondary_container = tone(30)
+        on_secondary_container = tone(90)
+    else:
+        primary = tone(40)
+        on_primary = tone(100)
+        primary_container = tone(90)
+        on_primary_container = tone(10)
+        surface = neutral(98)
+        surface_container = neutral(94)
+        on_surface = neutral(10)
+        surface_variant = neutral_variant(90)
+        outline = neutral_variant(50)
+        outline_variant = neutral_variant(80)
+        secondary_container = tone(90)
+        on_secondary_container = tone(10)
+
+    return {
+        "primary": primary.name(),
+        "onPrimary": on_primary.name(),
+        "primaryContainer": primary_container.name(),
+        "onPrimaryContainer": on_primary_container.name(),
+        "surface": surface.name(),
+        "surfaceContainer": surface_container.name(),
+        "onSurface": on_surface.name(),
+        "surfaceVariant": surface_variant.name(),
+        "outline": outline.name(),
+        "outlineVariant": outline_variant.name(),
+        "secondaryContainer": secondary_container.name(),
+        "onSecondaryContainer": on_secondary_container.name(),
+    }
+
+
 def _system_prefers_dark() -> bool:
+
     if sys.platform == "win32" and winreg is not None:
         try:
             with winreg.OpenKey(
@@ -921,14 +1059,96 @@ class FitButton(QPushButton):
         self.setFont(font)
 
 
+class WorldMapBackground(QWidget):
+    """Фон главного экрана: карта мира с низкой прозрачностью (как в Hiddify)."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._map: QPixmap | None = None
+        self._dark = False
+        self._load_map()
+
+    def _load_map(self) -> None:
+        path = Path(__file__).resolve().parent / "img" / "world_map.png"
+        if path.exists():
+            self._map = QPixmap(str(path))
+
+    def set_dark(self, dark: bool) -> None:
+        if dark != self._dark:
+            self._dark = dark
+            self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        super().paintEvent(event)
+        if self._map is None or self._map.isNull():
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        rect = self.rect()
+        scaled = self._map.scaled(
+            rect.size(),
+            Qt.KeepAspectRatioByExpanding,
+            Qt.SmoothTransformation,
+        )
+        x = (rect.width() - scaled.width()) // 2
+        y = (rect.height() - scaled.height()) // 2
+        painter.setOpacity(0.09)
+        if self._dark:
+            painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+            painter.drawPixmap(x, y, scaled)
+            painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
+            painter.fillRect(rect, QColor(255, 255, 255, 255))
+        else:
+            painter.drawPixmap(x, y, scaled)
+        painter.end()
+
+
+class ConnectionButton(QPushButton):
+    """Большая круглая кнопка подключения с логотипом внутри (как в Hiddify)."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("connectionButton")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(148, 148)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self._icon: QIcon | None = None
+        self._icon_size = 64
+        self._shadow = QGraphicsDropShadowEffect(self)
+        self._shadow.setBlurRadius(16)
+        self._shadow.setOffset(0, 0)
+        self._shadow.setColor(QColor(0, 0, 0, 128))
+        self.setGraphicsEffect(self._shadow)
+
+    def set_icon(self, icon: QIcon, size: int = 64) -> None:
+        self._icon = icon
+        self._icon_size = size
+        self.update()
+
+    def set_glow(self, color: QColor) -> None:
+        self._shadow.setColor(color)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        super().paintEvent(event)
+        if self._icon is None or self._icon.isNull():
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        size = self._icon_size
+        pix = self._icon.pixmap(size, size)
+        x = (self.width() - pix.width()) // 2
+        y = (self.height() - pix.height()) // 2
+        painter.drawPixmap(x, y, pix)
+        painter.end()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(_asset_icon())
-        self.resize(406, 680)
-        self.setMinimumSize(360, 560)
-        self.setMaximumSize(560, 860)
+        self.resize(360, 560)
+        self.setFixedSize(360, 560)
         self.setWindowFlag(Qt.WindowMaximizeButtonHint, False)
 
         self.log_lines: list[str] = []
@@ -969,6 +1189,7 @@ class MainWindow(QMainWindow):
         self.bridge.task_failed.connect(self._on_task_failed)
         self.runtime = AppRuntime(log_sink=self._runtime_log, event_sink=self._runtime_event)
         QApplication.instance().aboutToQuit.connect(self._shutdown_runtime)
+
         self.runtime.config.autostart_enabled = is_autostart_enabled()
         self._theme_name = _resolve_theme(self.runtime.config.appearance)
         QApplication.instance().setStyleSheet(THEMES[self._theme_name]["qss"])
@@ -977,6 +1198,8 @@ class MainWindow(QMainWindow):
         self._build_tray()
         self._refresh_settings_from_config()
         self._refresh_snapshot()
+
+
 
         self.snapshot_timer = QTimer(self)
         self.snapshot_timer.setInterval(1000)
@@ -1077,6 +1300,8 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         central = QWidget()
+        central.setObjectName("centralWidget")
+        central.setAttribute(Qt.WA_StyledBackground, True)
         root = QHBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.addStretch(1)
@@ -1090,6 +1315,9 @@ class MainWindow(QMainWindow):
         self.main_page, self.main_layout = self._plain_page()
         self.settings_page = self._build_settings_page()
         self.proxies_page = self._build_proxies_page()
+        for page in (self.main_page, self.settings_page, self.proxies_page):
+            page.setObjectName("page")
+            page.setAttribute(Qt.WA_StyledBackground, True)
         self.stack.addWidget(self.main_page)
         self.stack.addWidget(self.settings_page)
         self.stack.addWidget(self.proxies_page)
@@ -1116,8 +1344,7 @@ class MainWindow(QMainWindow):
         height = max(520, int(self.height() or 680))
         if height < 620:
             spacing = 3
-            hero_margins = (12, 10, 12, 8)
-            active_height = 76
+            active_height = 96
             stat_height = 68
             show_thread = False
             show_active_hint = False
@@ -1125,7 +1352,6 @@ class MainWindow(QMainWindow):
             show_hero_hint = False
         elif height < 760:
             spacing = 5
-            hero_margins = (14, 12, 14, 10)
             active_height = 98
             stat_height = 72
             show_thread = False
@@ -1134,13 +1360,12 @@ class MainWindow(QMainWindow):
             show_hero_hint = False
         else:
             spacing = 6
-            hero_margins = (16, 14, 16, 12)
             active_height = 112
             stat_height = 82
             show_thread = True
             show_active_hint = True
             show_footer = False
-            show_hero_hint = False
+            show_hero_hint = True
         self.main_layout.setSpacing(spacing)
         margin = 8 if height < 620 else 10 if height < 760 else 12
         self.main_layout.setContentsMargins(margin, margin, margin, margin)
@@ -1154,17 +1379,10 @@ class MainWindow(QMainWindow):
             self.footer_info.setVisible(show_footer)
         if hasattr(self, "choose_proxy_button"):
             self.choose_proxy_button.setVisible(height >= 760)
-        primary_size = 108 if height < 620 else 126 if height < 760 else 148
+        primary_size = 162 if height < 620 else 189 if height < 760 else 222
         self._primary_size = primary_size
         self.primary_button.setFixedSize(primary_size, primary_size)
         self.primary_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        if hasattr(self, "hero_layout"):
-            self.hero_layout.setContentsMargins(*hero_margins)
-            self.hero_layout.setSpacing(max(6, spacing))
-        if hasattr(self, "hero_card"):
-            hero_height = 218 if height < 620 else 250 if height < 760 else 280
-            self.hero_card.setFixedHeight(hero_height)
-            self.hero_card.updateGeometry()
         for card in getattr(self, "_stat_cards", []):
             card.setFixedHeight(stat_height)
             card.updateGeometry()
@@ -1182,14 +1400,35 @@ class MainWindow(QMainWindow):
         theme = THEMES[getattr(self, "_theme_name", "light")]
         color = theme["primary_on"] if running else theme["primary_off"]
         hover = theme["primary_on_hover"] if running else theme["primary_off_hover"]
+        text_color = "#FFFFFF" if running else (getattr(self, "_accent_text_on", None) or "#FFFFFF")
         self.primary_button.setStyleSheet(
-            f"QPushButton#primary {{"
-            f"border-radius:{self.primary_button.height() // 2}px;background:{color};color:#FFFFFF;border:none;"
-            f"font-size:{20 if self.primary_button.height() < 120 else 22 if self.primary_button.height() < 140 else 24}px;font-weight:700;padding:0px;"
-            f"}} QPushButton#primary:hover {{ background:{hover}; }}"
+            f"QPushButton#connectionButton {{"
+            f"border-radius:{self.primary_button.height() // 2}px;background:{color};color:{text_color};border:none;"
+            f"}} QPushButton#connectionButton:hover {{ background:{hover}; }}"
         )
         primary_size = int(getattr(self, "_primary_size", 84) or 84)
         self.primary_button.setFixedSize(primary_size, primary_size)
+        glow = QColor(theme["primary_on"] if running else theme["primary_off"])
+        glow.setAlpha(128)
+        self.primary_button.set_glow(glow)
+
+    def _apply_delay_card_style(self) -> None:
+        """Делает карточку «Пинг» закруглённой с акцентной заливкой и hover-эффектом."""
+        if not hasattr(self, "delay_card"):
+            return
+        theme = THEMES[getattr(self, "_theme_name", "light")]
+        accent = getattr(self, "_accent_hex", None) or theme["primary_off"]
+        hover = theme["primary_off_hover"]
+        text_on = getattr(self, "_accent_text_on", None) or "#FFFFFF"
+        self.delay_card.setStyleSheet(
+            f"QFrame#delayCard {{"
+            f"background:{accent};border:none;border-radius:22px;"
+            f"}} QFrame#delayCard:hover {{ background:{hover}; }}"
+        )
+        for label in (self.delay_title, self.ping_value):
+            if label is not None:
+                label.setStyleSheet(f"color:{text_on};font-size:{label.property('mtSize') or 14}px;font-weight:700;")
+
 
     def _page(self) -> tuple[QWidget, QVBoxLayout]:
         scroll = QScrollArea()
@@ -1197,6 +1436,7 @@ class MainWindow(QMainWindow):
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         body = QWidget()
+        body.setObjectName("page")
         body.setMinimumWidth(0)
         body.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         layout = QVBoxLayout(body)
@@ -1207,6 +1447,7 @@ class MainWindow(QMainWindow):
 
     def _plain_page(self) -> tuple[QWidget, QVBoxLayout]:
         page = QWidget()
+        page.setObjectName("page")
         layout = QVBoxLayout(page)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(8)
@@ -1238,15 +1479,110 @@ class MainWindow(QMainWindow):
                 f"background:{theme['badge_bg']};color:{theme['badge_fg']};"
                 "border-radius:12px;padding:4px 10px;font-weight:700;"
             )
-        if hasattr(self, "status_chip"):
+        if hasattr(self, "delay_card"):
+            self._apply_delay_card_style()
+        if hasattr(self, "profile_title"):
             self._refresh_snapshot()
         else:
             self._apply_primary_style()
 
+    def _apply_accent_theme(self) -> None:
+        """Monet-система: генерирует Material 3 tonal palette из акцентного цвета Windows.
+
+        Строит локальный QSS на основе базовой темы, не мутируя глобальный THEMES,
+        чтобы переключение светлой/тёмной темы не ломалось.
+        """
+        accent = _windows_accent_color()
+        theme_name = getattr(self, "_theme_name", "light")
+        base_theme = THEMES[theme_name]
+        if accent is None:
+            self._monet_qss = None
+            self._monet = None
+            self._accent_hex = None
+            self._accent_text_on = None
+            return
+
+        dark = theme_name == "dark"
+        palette = _monet_palette(accent, dark)
+        self._monet = palette
+        self._accent_hex = palette["primary"]
+        self._accent_text_on = palette["onPrimary"]
+
+        # --- Базовый QSS темы ---
+        qss = base_theme["qss"]
+
+        # --- Замена фирменных фиолетовых на акцентные (primary) ---
+        if dark:
+            qss = qss.replace("#9A90FF", palette["primary"])
+            qss = qss.replace("#B0A7FF", palette["primaryContainer"])
+            qss = qss.replace("#8176F0", palette["primaryContainer"])
+        else:
+            qss = qss.replace("#6158C7", palette["primary"])
+            qss = qss.replace("#5148B8", palette["primaryContainer"])
+            qss = qss.replace("#443AA3", palette["primaryContainer"])
+
+        # --- Фон приложения и карточки ---
+        qss += (
+            f"\nQMainWindow, QWidget#centralWidget {{ background: {palette['surface']}; }}"
+            f"\nQWidget#page {{ background: {palette['surface']}; }}"
+            f"\nQFrame#card, QFrame#rowCard, QFrame#activeCard, QFrame#proxyRow, "
+            f"QFrame#aboutCard, QFrame#profileCard {{"
+            f" background: {palette['surfaceContainer']}; border: 1px solid {palette['outlineVariant']}; }}"
+            f"\nQFrame#fieldCard {{ background: {palette['surfaceVariant']}; "
+            f"border: 1px solid {palette['outlineVariant']}; }}"
+            f"\nQFrame#activeCard:hover, QFrame#rowCard:hover, QFrame#profileCard:hover {{"
+            f" background: {palette['primaryContainer']}; border: 1px solid {palette['primary']}; }}"
+            f"\nQPushButton {{ background: {palette['surfaceContainer']}; "
+            f"border: 1px solid {palette['outlineVariant']}; color: {palette['onSurface']}; }}"
+            f"\nQPushButton:hover {{ background: {palette['surfaceVariant']}; }}"
+            f"\nQPushButton#accent {{ background: {palette['primary']}; color: {palette['onPrimary']}; "
+            f"border: 1px solid {palette['primary']}; }}"
+            f"\nQPushButton#accent:hover {{ background: {palette['primaryContainer']}; "
+            f"color: {palette['onPrimaryContainer']}; border: 1px solid {palette['primaryContainer']}; }}"
+            f"\nQPushButton#soft {{ background: {palette['secondaryContainer']}; "
+            f"color: {palette['onSecondaryContainer']}; border: 1px solid {palette['secondaryContainer']}; }}"
+            f"\nQPushButton#soft:hover {{ background: {palette['primaryContainer']}; "
+            f"color: {palette['onPrimaryContainer']}; }}"
+            f"\nQToolButton {{ background: {palette['surfaceContainer']}; "
+            f"border: 1px solid {palette['outlineVariant']}; color: {palette['onSurface']}; }}"
+            f"\nQToolButton#soft {{ background: {palette['secondaryContainer']}; "
+            f"color: {palette['onSecondaryContainer']}; border: 1px solid {palette['secondaryContainer']}; }}"
+            f"\nQToolButton#soft:hover {{ background: {palette['primaryContainer']}; "
+            f"color: {palette['onPrimaryContainer']}; }}"
+            f"\nQProgressBar {{ background: {palette['surfaceVariant']}; }}"
+            f"\nQProgressBar::chunk {{ background: {palette['primary']}; }}"
+            f"\nQLineEdit, QSpinBox, QComboBox, QTextEdit, QPlainTextEdit {{"
+            f" background: {palette['surfaceVariant']}; border: 1px solid {palette['outlineVariant']}; "
+            f"color: {palette['onSurface']}; }}"
+            f"\nQCheckBox::indicator {{ border: 2px solid {palette['primary']}; "
+            f"background: {palette['surfaceContainer']}; }}"
+            f"\nQCheckBox::indicator:checked {{ background: {palette['primary']}; }}"
+            f"\nQListWidget#cardList::item:selected {{ background: {palette['secondaryContainer']}; }}"
+            f"\nQListWidget#cardList::item:hover {{ background: {palette['primaryContainer']}; }}"
+        )
+
+        # --- Текстовые роли темы ---
+        base_theme["text"] = palette["onSurface"]
+        base_theme["soft"] = palette["outline"]
+        base_theme["badge_bg"] = palette["secondaryContainer"]
+        base_theme["badge_fg"] = palette["onSecondaryContainer"]
+        base_theme["alert_bg"] = palette["surfaceContainer"]
+        base_theme["alert_border"] = palette["outlineVariant"]
+        base_theme["primary_off"] = palette["primary"]
+        base_theme["primary_off_hover"] = palette["primaryContainer"]
+        base_theme["proxy_selected_bg"] = palette["primaryContainer"]
+        base_theme["proxy_selected_border"] = palette["primary"]
+        base_theme["proxy_bg"] = palette["surfaceContainer"]
+        base_theme["proxy_border"] = palette["outlineVariant"]
+
+        self._monet_qss = qss
+
     def apply_appearance(self, appearance: str | None = None) -> None:
         appearance = appearance or self.runtime.config.appearance
         self._theme_name = _resolve_theme(appearance)
-        QApplication.instance().setStyleSheet(THEMES[self._theme_name]["qss"])
+        self._apply_accent_theme()
+        qss = getattr(self, "_monet_qss", None) or THEMES[self._theme_name]["qss"]
+        QApplication.instance().setStyleSheet(qss)
         self._refresh_themed_widgets()
 
     def _card(self, name: str = "card") -> QFrame:
@@ -1281,6 +1617,7 @@ class MainWindow(QMainWindow):
         kind: str = "info",
         buttons: list[tuple[str, str, Callable[[bool], None] | None]] | None = None,
         checkbox_text: str | None = None,
+        vertical: bool = False,
     ) -> None:
         self._close_alert_overlay()
         overlay = DismissibleOverlay(self.centralWidget())
@@ -1320,11 +1657,14 @@ class MainWindow(QMainWindow):
         if remember is not None:
             body.addWidget(remember)
 
-        actions = QHBoxLayout()
+        actions = QVBoxLayout() if vertical else QHBoxLayout()
         actions.setSpacing(10)
         dialog_buttons = buttons or [("Ок", "accent", None)]
         for label, style, callback in dialog_buttons:
             button = self._button(label, accent=style == "accent", soft=style == "soft", danger=style == "danger")
+            if vertical:
+                button.setMinimumHeight(44)
+                button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
             def handle_click(
                 _checked: bool = False,
@@ -1377,31 +1717,51 @@ class MainWindow(QMainWindow):
         )
 
     def _build_main_page(self, layout: QVBoxLayout) -> None:
-        header = QHBoxLayout()
-        title_row = QHBoxLayout()
-        title = self._label("MTProxy", size=24, bold=True)
-        self.version_badge = QLabel(f"v{APP_PUBLIC_VERSION}")
         theme = THEMES[getattr(self, "_theme_name", "light")]
+
+        # --- AppBar: логотип + название + версия + кнопка настроек ---
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        logo = QLabel()
+        logo.setPixmap(_asset_icon().pixmap(28, 28))
+        logo.setFixedSize(28, 28)
+        header.addWidget(logo)
+        title = self._label("MTProxy", size=22, bold=True)
+        header.addWidget(title)
+        self.version_badge = QLabel(f"v{APP_PUBLIC_VERSION}")
         self.version_badge.setStyleSheet(
             f"background:{theme['badge_bg']};color:{theme['badge_fg']};"
             "border-radius:12px;padding:4px 10px;font-weight:700;"
         )
-        title_row.addWidget(title)
-        title_row.addWidget(self.version_badge)
-        title_row.addStretch(1)
-        self.settings_button = self._button("Настройки")
+        header.addWidget(self.version_badge)
+        header.addStretch(1)
+        self.settings_button = self._button("⚙ Настройки")
+        self.settings_button.setToolTip("Настройки")
         self.settings_button.clicked.connect(self.open_settings)
-        header.addLayout(title_row, 1)
         header.addWidget(self.settings_button)
         layout.addLayout(header)
 
-        self.status_chip = QLabel("Подготовка")
-        self.status_chip.setStyleSheet(
-            f"background:{theme['status_on_bg']};color:{theme['status_on_fg']};"
-            "border-radius:16px;padding:8px 14px;font-weight:700;"
-        )
-        layout.addWidget(self.status_chip, 0, Qt.AlignLeft)
 
+        # --- ProfileTile: карточка активного режима (клик открывает выбор режима) ---
+        self.profile_card = ClickableFrame()
+        self.profile_card.setObjectName("profileCard")
+        self.profile_card.setCursor(QCursor(Qt.PointingHandCursor))
+        self.profile_card.clicked.connect(self.open_mode_picker)
+        profile_layout = QHBoxLayout(self.profile_card)
+        profile_layout.setContentsMargins(16, 14, 16, 14)
+        profile_layout.setSpacing(10)
+        profile_text_col = QVBoxLayout()
+        profile_text_col.setSpacing(2)
+        self.profile_title = self._label("Режим работы", size=15, bold=True)
+        profile_text_col.addWidget(self.profile_title)
+        self.profile_subtitle = self._label("MTProxy Picker", size=11, soft=True)
+        profile_text_col.addWidget(self.profile_subtitle)
+        profile_layout.addLayout(profile_text_col, 1)
+        self.profile_arrow = self._label("▾", size=18, soft=True)
+        profile_layout.addWidget(self.profile_arrow)
+        layout.addWidget(self.profile_card)
+
+        # --- Прогресс ---
         self.progress = QProgressBar()
         self.progress.setRange(0, 1000)
         self.progress.setValue(0)
@@ -1412,33 +1772,18 @@ class MainWindow(QMainWindow):
         self.thread_text = self._label("Telegram-источники еще не проверялись", size=11, soft=True)
         layout.addWidget(self.thread_text)
 
-        hero = self._card()
-        self.hero_card = hero
-        hero.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        hero_layout = QVBoxLayout(hero)
-        self.hero_layout = hero_layout
-        hero_layout.setContentsMargins(16, 16, 16, 12)
-        hero_layout.setSpacing(10)
-        self.primary_button = QPushButton("Пуск")
-        self.primary_button.setObjectName("primary")
+        # --- Большая круглая кнопка подключения (как в Hiddify) ---
+        self.primary_button = ConnectionButton()
+        self.primary_button.set_icon(_asset_icon(), 64)
         self.primary_button.setProperty("started", "false")
         self.primary_button.clicked.connect(self.primary_action)
-        mode_row = QHBoxLayout()
-        mode_row.setSpacing(10)
-        mode_row.addWidget(self._label("Режим работы", size=15, bold=True))
-        self.mode_combo = self._combo([MODE_LABELS[key] for key in ("mtproxy_picker", "xray_core", "tg_ws_proxy")])
-        self.mode_combo.currentTextChanged.connect(self.change_active_mode)
-        mode_row.addWidget(self.mode_combo, 1)
-        hero_layout.addLayout(mode_row)
-        hero_layout.addWidget(self.primary_button, 0, Qt.AlignHCenter)
-        self.restart_mode_button = self._button("Перезапустить режим", soft=True)
-        self.restart_mode_button.clicked.connect(self.restart_active_mode)
-        hero_layout.addWidget(self.restart_mode_button)
-        self.restart_mode_button.setVisible(False)
+        layout.addWidget(self.primary_button, 0, Qt.AlignHCenter)
         self.primary_hint = self._label("Запускает или останавливает только выбранный режим.", soft=True)
-        self.primary_hint.setAlignment(Qt.AlignCenter)
-        hero_layout.addWidget(self.primary_hint)
-        hero_actions = QHBoxLayout()
+        layout.addWidget(self.primary_hint)
+
+        # --- Кнопки действий: Обновить / Подключиться ---
+        actions_row = QHBoxLayout()
+        actions_row.setSpacing(8)
         self.refresh_button = QToolButton(self)
         self.refresh_button.setText("Обновить")
         self.refresh_button.setObjectName("soft")
@@ -1446,56 +1791,64 @@ class MainWindow(QMainWindow):
         self.refresh_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
         self.refresh_button.setPopupMode(QToolButton.InstantPopup)
         self.refresh_button.setMinimumHeight(34)
-        self.refresh_button.clicked.connect(self.start_refresh)
+        self.refresh_button.clicked.connect(self.refresh_button_clicked)
         self.refresh_menu = QMenu(self)
         self.refresh_full_action = QAction("Полное обновление", self)
         self.refresh_full_action.triggered.connect(lambda: self.start_refresh(manual=True))
-        self.refresh_fast_action = QAction("Быстрое обновление", self)
-        self.refresh_fast_action.triggered.connect(lambda: self.start_refresh(manual=True, fast=True))
         self.refresh_pool_action = QAction("Перепроверить пул", self)
-        self.refresh_pool_action.triggered.connect(self.quick_probe)
+        self.refresh_pool_action.triggered.connect(self.recheck_pool)
+        self.refresh_stress_action = QAction("Стресс-тест", self)
+        self.refresh_stress_action.triggered.connect(self.stress_test_proxies)
         self.refresh_menu.addAction(self.refresh_full_action)
-        self.refresh_menu.addAction(self.refresh_fast_action)
         self.refresh_menu.addAction(self.refresh_pool_action)
+        self.refresh_menu.addAction(self.refresh_stress_action)
         self.refresh_button.setMenu(self.refresh_menu)
-        self.stress_button = self._button("Стресс-тест")
-        self.stress_button.clicked.connect(self.stress_test_proxies)
-        # обе кнопки hero — одной ширины, без растягивания в layout
-        self.stress_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self.refresh_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        hero_width = max(self.refresh_button.sizeHint().width(), self.stress_button.sizeHint().width())
-        self.refresh_button.setMinimumWidth(hero_width)
-        self.stress_button.setMinimumWidth(hero_width)
-        hero_actions.addWidget(self.refresh_button)
-        hero_actions.addWidget(self.stress_button)
-        hero_layout.addLayout(hero_actions)
-        layout.addWidget(hero)
-
-        connect_actions = QHBoxLayout()
-        self.copy_button = self._button("Скопировать")
-        self.copy_button.clicked.connect(self.copy_local_link)
         self.connect_button = self._button("Подключиться", accent=True)
         self.connect_button.clicked.connect(self.connect_local_proxy)
-        connect_actions.addWidget(self.copy_button)
-        connect_actions.addWidget(self.connect_button)
-        layout.addLayout(connect_actions)
+        self.refresh_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.connect_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        actions_row.addWidget(self.refresh_button, 1)
+        actions_row.addWidget(self.connect_button, 1)
+        layout.addLayout(actions_row)
 
+
+        # --- Стат-карточки (Рабочих / Пинг / Скорость) ---
         stats = QGridLayout()
         stats.setSpacing(8)
         self._stat_cards: list[QFrame] = []
         self.pool_value = self._stat_card(stats, 0, "Рабочих")
-        self.ping_value = self._stat_card(stats, 1, "Пинг")
+
+        # --- Карточка «Пинг», клик = сортировка по пингу ---
+        self.delay_card = ClickableFrame()
+        self.delay_card.setObjectName("delayCard")
+        self.delay_card.setCursor(QCursor(Qt.PointingHandCursor))
+        self.delay_card.clicked.connect(self.sort_proxy_pool)
+        self._stat_cards.append(self.delay_card)
+        self.delay_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.delay_card.setMinimumHeight(86)
+        self.delay_card.setMaximumHeight(96)
+        delay_layout = QVBoxLayout(self.delay_card)
+        delay_layout.setContentsMargins(12, 10, 12, 10)
+        self.delay_title = self._label("Пинг", size=10, soft=True)
+        delay_layout.addWidget(self.delay_title)
+        self.ping_value = self._label("n/a", size=14, bold=True)
+        delay_layout.addWidget(self.ping_value)
+        stats.addWidget(self.delay_card, 0, 1)
+        self._apply_delay_card_style()
+
         self.speed_value = self._stat_card(stats, 2, "Скорость", value_size=16)
         layout.addLayout(stats)
 
+        # --- Футер: активный upstream + статистика ---
         self.active_card = ClickableFrame()
         self.active_card.setObjectName("activeCard")
         self.active_card.setCursor(QCursor(Qt.PointingHandCursor))
         self.active_card.clicked.connect(self.open_proxy_picker)
         active_layout = QVBoxLayout(self.active_card)
-        active_layout.setContentsMargins(16, 14, 16, 14)
+        active_layout.setContentsMargins(16, 12, 16, 12)
+        active_layout.setSpacing(4)
         top = QHBoxLayout()
-        top.addWidget(self._label("Активный upstream", size=15, bold=True))
+        top.addWidget(self._label("Активный upstream", size=13, bold=True))
         top.addStretch(1)
         self.choose_proxy_button = self._button("Выбрать", soft=True)
         self.choose_proxy_button.clicked.connect(self.open_proxy_picker)
@@ -1508,6 +1861,7 @@ class MainWindow(QMainWindow):
         self.footer_info = self._label("Стартовая инициализация", size=11, soft=True)
         active_layout.addWidget(self.footer_info)
         layout.addWidget(self.active_card)
+
         layout.addStretch(1)
 
         self._wrapping_labels = [
@@ -1539,6 +1893,7 @@ class MainWindow(QMainWindow):
 
     def _build_settings_page(self) -> QWidget:
         page = QWidget()
+        page.setObjectName("page")
         layout = QVBoxLayout(page)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
@@ -1569,7 +1924,9 @@ class MainWindow(QMainWindow):
             "about": self._settings_about(),
         }
         for widget in self.settings_pages.values():
+            widget.setObjectName("page")
             self.settings_stack.addWidget(widget)
+        self.settings_stack.setObjectName("page")
         layout.addWidget(self.settings_stack, 1)
 
         footer = QHBoxLayout()
@@ -2243,14 +2600,6 @@ class MainWindow(QMainWindow):
         )
         layout.addWidget(
             self._about_card(
-                "MIFA",
-                "Источник стандартных подписок для режима sing-box.",
-                "Открыть mifa.world",
-                "https://mifa.world/",
-            )
-        )
-        layout.addWidget(
-            self._about_card(
                 "Telegram автора",
                 "Канал автора проекта.",
                 "Открыть Telegram автора",
@@ -2282,6 +2631,7 @@ class MainWindow(QMainWindow):
 
     def _build_proxies_page(self) -> QWidget:
         page = QWidget()
+        page.setObjectName("page")
         layout = QVBoxLayout(page)
         layout.setContentsMargins(16, 16, 16, 16)
         top = QHBoxLayout()
@@ -2359,12 +2709,20 @@ class MainWindow(QMainWindow):
         for widget in widgets:
             widget.setProperty("showHelp", True)
 
-    def _help_marker(self, text: str) -> QLabel:
+    def _help_marker(self, text: str) -> QWidget:
+        frame = ClickableFrame()
+        frame.setToolTip(text)
+        frame.setFixedWidth(18)
+        frame.setFixedHeight(18)
+        frame.setCursor(Qt.PointingHandCursor)
+        layout = QHBoxLayout(frame)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         marker = self._label("?", size=11, soft=True)
-        marker.setToolTip(text)
-        marker.setFixedWidth(18)
         marker.setAlignment(Qt.AlignCenter)
-        return marker
+        layout.addWidget(marker)
+        frame.clicked.connect(lambda: self.show_info("Справка", text))
+        return frame
 
     def _form_row(self, label: str, widget: QWidget) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -2665,6 +3023,38 @@ class MainWindow(QMainWindow):
     def open_proxy_picker(self) -> None:
         self._refresh_proxy_page()
         self.stack.setCurrentWidget(self.proxies_page)
+
+    def open_mode_picker(self) -> None:
+        if self._warn_runtime_busy():
+            return
+
+        def pick(label: str) -> None:
+            self.change_active_mode(label)
+
+        active_mode = str(getattr(self.runtime.config, "active_mode", "mtproxy_picker") or "mtproxy_picker")
+        buttons: list[tuple[str, str, Callable[[bool], None] | None]] = []
+        for key, label in MODE_LABELS.items():
+            style = "accent" if key == active_mode else "soft"
+            buttons.append((label, style, lambda _checked, lbl=label: pick(lbl)))
+
+        self._show_in_app_dialog(
+            "Выбор режима",
+            "Выберите режим работы:",
+            kind="info",
+            buttons=buttons,
+            vertical=True,
+        )
+
+    def recheck_pool(self) -> None:
+        if self._warn_runtime_busy():
+            return
+        if self.runtime.config.active_mode != "mtproxy_picker":
+            self.show_info("Перепроверить пул", "Быстрая проверка доступна только в режиме «Подбор прокси».")
+            return
+        if self.runtime.pool.count() <= 0:
+            self.show_warning("Пул пуст", "Сначала выполните полное обновление, чтобы собрать базу прокси.")
+            return
+        self.quick_probe()
 
     def _refresh_settings_from_config(self) -> None:
         self._settings_refreshing = True
@@ -3101,14 +3491,16 @@ class MainWindow(QMainWindow):
             "proxy_import_button",
             "proxy_delete_button",
             "proxy_stress_button",
-            "stress_button",
+            "profile_card",
+            "delay_card",
         ):
             widget = getattr(self, widget_name, None)
             if widget is not None:
                 widget.setEnabled(not busy)
         if hasattr(self, "refresh_button"):
             self.refresh_button.setEnabled(True)
-            if busy:
+            is_local = getattr(self.runtime.config, "active_mode", None) == "tg_ws_proxy"
+            if busy or is_local:
                 self.refresh_button.setMenu(None)
             elif hasattr(self, "refresh_menu"):
                 self.refresh_button.setMenu(self.refresh_menu)
@@ -3160,6 +3552,13 @@ class MainWindow(QMainWindow):
         if self._warn_runtime_busy():
             return
         self.run_task("stop_local", self.runtime.stop_active_mode)
+
+    def refresh_button_clicked(self, checked: bool = False) -> None:
+        """Кнопка «Обновить»: в режиме локального прокси перезапускает сервис, иначе — обновление."""
+        if getattr(self.runtime.config, "active_mode", None) == "tg_ws_proxy":
+            self.restart_active_mode()
+            return
+        self.start_refresh(checked)
 
     def start_refresh(self, checked: bool = False, *, manual: bool = True, fast: bool = False) -> None:
         if self.refresh_in_progress:
@@ -3270,17 +3669,10 @@ class MainWindow(QMainWindow):
             self.routing_mode_combo.blockSignals(False)
         self._local_running = running
         mode_title = MODE_LABELS.get(mode, mode)
-        self.status_chip.setText(f"{mode_title}: активен" if running else f"{mode_title}: не запущен")
-        theme = THEMES[getattr(self, "_theme_name", "light")]
-        self.status_chip.setStyleSheet(
-            (
-                f"background:{theme['status_on_bg']};color:{theme['status_on_fg']};"
-                if running
-                else f"background:{theme['status_off_bg']};color:{theme['status_off_fg']};"
-            )
-            + "border-radius:16px;padding:8px 14px;font-weight:700;"
-        )
-        self.primary_button.setText("Стоп" if running else "Пуск")
+        if hasattr(self, "profile_title"):
+            self.profile_title.setText(mode_title)
+        if hasattr(self, "profile_subtitle"):
+            self.profile_subtitle.setText("Активен" if running else "Не запущен")
         self.primary_button.setProperty("started", "true" if running else "false")
         self._apply_primary_style()
         local_endpoint = str(snapshot.get("endpoint") or f"{self.runtime.config.local_host}:{self.runtime.config.local_port}")
@@ -3290,9 +3682,15 @@ class MainWindow(QMainWindow):
             else str(snapshot.get("status_text") or "Режим ожидает запуска.")
         )
         self.pool_value.setText(str(len(rows)))
-        best_row = rows[0] if rows else {}
-        latency = best_row.get("latency_ms") or best_row.get("live_latency_ms") or best_row.get("base_latency_ms") or best_row.get("connect_latency_ms")
-        self.ping_value.setText(_format_latency(latency))
+        if mode == "tg_ws_proxy":
+            ping_ms = snapshot.get("ping_ms")
+            self.ping_value.setText(_format_latency(ping_ms))
+        else:
+            best_row = rows[0] if rows else {}
+            latency = best_row.get("latency_ms") or best_row.get("live_latency_ms") or best_row.get("base_latency_ms") or best_row.get("connect_latency_ms")
+            latency_text = _format_latency(latency)
+            self.ping_value.setText(latency_text)
+
         if hasattr(self, "speed_title"):
             self.speed_title.setText("Скорость")
         if mode == "mtproxy_picker":

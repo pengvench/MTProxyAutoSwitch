@@ -412,7 +412,16 @@ class AppRuntime:
         self.live_probe_thread.start()
         self._auth_code_hash: str = ""
         self._auth_code_phone: str = ""
-        self.start_active_mode(initial=True)
+        # Старт активного режима выполняется в фоновом потоке, чтобы не блокировать
+        # GUI-поток при инициализации (refresh подписок sing-box и проба узлов —
+        # длительные сетевые операции). Окно приложения должно отобразиться сразу.
+        self._startup_thread = threading.Thread(
+            target=self._start_active_mode_background,
+            daemon=True,
+            name="mtproxy-start-active-mode",
+        )
+        self._startup_thread.start()
+
 
     @property
     def auth_config(self) -> TelegramAuthConfig:
@@ -805,11 +814,23 @@ class AppRuntime:
         else:
             self.stop_local_server()
 
+    def _start_active_mode_background(self) -> None:
+        """Фоновый старт активного режима при инициализации.
+
+        Вызывается в отдельном daemon-потоке, чтобы длительные сетевые операции
+        (refresh подписок sing-box, проба узлов) не блокировали GUI-поток.
+        """
+        try:
+            self.start_active_mode(initial=True)
+        except Exception as exc:
+            self._log(f"[mode] background start failed: {exc}")
+
     def start_active_mode(self, *, initial: bool = False) -> bool:
         if self._shutdown_requested:
             return False
         mode = self.config.active_mode if self.config.active_mode in APP_MODES else "mtproxy_picker"
         self.stop_all_modes()
+
 
         if mode == "tg_ws_proxy":
             self.tg_ws_server.start()
@@ -1389,15 +1410,17 @@ class AppRuntime:
                 "local_url": self.tg_ws_server.local_proxy_url,
                 "local_tg_url": self.tg_ws_server.local_tg_url,
                 "endpoint": self.tg_ws_server.config.endpoint,
-                "best_proxy": "Telegram WebSocket bridge",
+                "best_proxy": "",
                 "status_text": "Локальный прокси активен" if running else (self.tg_ws_server.last_error or "Локальный прокси остановлен"),
                 "pool_rows": [],
-                "working_count": 1 if running else 0,
+                "working_count": 0,
                 "rejected_count": 0,
-                "unique_count": 1 if running else 0,
+                "unique_count": 0,
                 "bytes_up": int(getattr(tg_ws_stats, "bytes_up", 0) or 0),
                 "bytes_down": int(getattr(tg_ws_stats, "bytes_down", 0) or 0),
                 "connections_active": int(getattr(tg_ws_stats, "connections_active", 0) or 0),
+                "ping_ms": float(getattr(tg_ws_stats, "ping_ms", 0.0) or 0.0),
+
                 "balancer_strategy": self.config.balancer_strategy,
                 "manual_upstream_url": "",
                 "telegram_api_proxy_url": self.config.telegram_api_proxy_url,

@@ -17,6 +17,9 @@ class _Stats:
         self.pool_misses = 0
         self.cf_pool_hits = 0
         self.cf_pool_misses = 0
+        self.ping_ms = 0.0
+        self.ping_updated_at = 0.0
+
 
     def summary(self) -> str:
         pool_total = self.pool_hits + self.pool_misses
