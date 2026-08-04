@@ -66,7 +66,7 @@ XRAY_ACTIVE_SPEED_TEST_SECONDS = 8.0
 
 # Быстрые HTTPS-цели для проверки пинга (лёгкие, без больших тел ответа).
 GSTATIC_GENERATE_204 = ("www.gstatic.com", 443, "www.gstatic.com", "/generate_204")
-IP_SB_GEOIP = ("api.ip.sb", 443, "api.ip.sb", "/geoip")
+IP_SB_IP = ("api.ip.sb", 443, "api.ip.sb", "/ip")
 
 
 XRAY_PROTOCOLS = {"vless", "vmess", "trojan", "shadowsocks"}
@@ -684,9 +684,9 @@ class XrayCoreRuntime:
             self._assign_to_process_job(proc)
             time.sleep(0.2)
             if proc.poll() is not None:
-                return XrayProbeResult(node, False, "core exited", None, 0, len(GSTATIC_GENERATE_204) + len(IP_SB_GEOIP), node.runtime)
+                return XrayProbeResult(node, False, "core exited", None, 0, len(GSTATIC_GENERATE_204) + len(IP_SB_IP), node.runtime)
             ping_latencies: list[float] = []
-            for host, target_port, server_name, path in (GSTATIC_GENERATE_204, IP_SB_GEOIP):
+            for host, target_port, server_name, path in (GSTATIC_GENERATE_204, IP_SB_IP):
                 latency = _socks_https_latency(
                     "127.0.0.1",
                     port,
@@ -699,7 +699,7 @@ class XrayCoreRuntime:
                 if latency is not None:
                     ping_latencies.append(latency)
             if not ping_latencies:
-                return XrayProbeResult(node, False, "quick_ping_failed", None, 0, len(GSTATIC_GENERATE_204) + len(IP_SB_GEOIP), node.runtime)
+                return XrayProbeResult(node, False, "quick_ping_failed", None, 0, len(GSTATIC_GENERATE_204) + len(IP_SB_IP), node.runtime)
             ping_latency = min(ping_latencies)
             accepted = ping_latency < 5000
             download_kbps = _xray_download_speed("127.0.0.1", port, float(self.config.probe_timeout_sec or 8.0)) if accepted else None
@@ -709,13 +709,13 @@ class XrayCoreRuntime:
                 "ready" if accepted else "slow",
                 ping_latency,
                 len(ping_latencies),
-                len(GSTATIC_GENERATE_204) + len(IP_SB_GEOIP),
+                len(GSTATIC_GENERATE_204) + len(IP_SB_IP),
                 node.runtime,
                 dc_latency_ms=ping_latency,
                 download_kbps=download_kbps,
             )
         except Exception as exc:
-            return XrayProbeResult(node, False, str(exc), None, 0, len(GSTATIC_GENERATE_204) + len(IP_SB_GEOIP), node.runtime)
+            return XrayProbeResult(node, False, str(exc), None, 0, len(GSTATIC_GENERATE_204) + len(IP_SB_IP), node.runtime)
 
         finally:
             if proc is not None and proc.poll() is None:
